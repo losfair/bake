@@ -5,7 +5,6 @@ use std::{
     sync::{Arc, LazyLock, atomic::Ordering},
     time::Duration,
 };
-use tokio::sync::Mutex;
 
 use fast_socks5::{
     ReplyError, Socks5Command, consts,
@@ -31,6 +30,7 @@ pub fn run_socks5_unix(uds_path: &Path) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
+        .thread_name("bake-s5unix")
         .build()
         .unwrap();
     let listener = rt.block_on(async { UnixListener::bind(uds_path) })?;
@@ -58,6 +58,7 @@ pub fn run_socks5_udp_unix(uds_path: &Path) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
+        .thread_name("bake-s5udp")
         .build()
         .unwrap();
     let listener = rt.block_on(async { UnixListener::bind(uds_path) })?;
@@ -85,6 +86,7 @@ pub fn run_socks5_vsock() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
+        .thread_name("bake-s5vsock")
         .build()
         .unwrap();
     let listener = rt.block_on(async { VsockListener::bind(VsockAddr::new(u32::MAX, 10)) })?;
@@ -111,6 +113,7 @@ pub fn run_socks5_tcp_to_vsock_proxy() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
+        .thread_name("bake-s5t2v")
         .build()
         .unwrap();
     let listener = rt.block_on(async { TcpListener::bind("127.0.0.10:10").await })?;
@@ -140,20 +143,21 @@ pub fn run_socks5_udp_injection(tun2socks_ifname: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
+        .thread_name("bake-s5udpinj")
         .build()
         .unwrap();
     let udp =
         rt.block_on(async { RawUdp::open(tun2socks_ifname, "198.18.0.2".parse().unwrap()) })?;
-    let udp = Arc::new(Mutex::new(udp));
+    let udp = Arc::new(udp);
     let host = rt.block_on(async { VsockStream::connect(VsockAddr::new(2, 11)).await })?;
     rt.spawn(async move {
         let (mut rx, mut tx) = tokio::io::split(host);
         let udp_rx = udp.clone();
-        let udp_tx = udp.clone();
+        let udp_tx = udp;
 
         let rx_fut = async {
             loop {
-                let msg = udp_rx.lock().await.recv().await?;
+                let msg = udp_rx.recv().await?;
                 let msg = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
                 tx.write_all(&(msg.len() as u32).to_le_bytes()).await?;
                 tx.write_all(&msg).await?;
@@ -176,8 +180,6 @@ pub fn run_socks5_udp_injection(tun2socks_ifname: &str) -> anyhow::Result<()> {
                 //     pkt.dst_port.to_native(),
                 // );
                 udp_tx
-                    .lock()
-                    .await
                     .inject(
                         pkt.src_ip.as_ipv4(),
                         pkt.dst_ip.as_ipv4(),
@@ -367,8 +369,20 @@ fn portmap_elem_init(
                     }
                 }
                 let IpAddr::V4(ip) = addr.ip() else {
+                    if DEBUG.load(Ordering::Relaxed) {
+                        eprintln!("dropping packet with invalid source: {}", addr);
+                    }
                     continue;
                 };
+                if DEBUG.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "UDP RX: {}:{} -> {}:{}",
+                        ip,
+                        addr.port(),
+                        client_addr.ip(),
+                        client_addr.port()
+                    );
+                }
                 let _ = UDPBUS_RX.send(UdpPacket {
                     src_ip: ip,
                     dst_ip: *client_addr.ip(),

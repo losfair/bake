@@ -1,15 +1,26 @@
+use crate::util::{ArchivedVolumeManifest, best_effort_raise_fd_limit, set_nonblocking};
+use anyhow::Context;
+use nix::mount::MsFlags;
 use serde_json::json;
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, OpenOptions, Permissions},
     io::Write,
+    os::{
+        fd::{AsFd, AsRawFd},
+        unix::{
+            fs::{OpenOptionsExt, PermissionsExt},
+            process::CommandExt,
+        },
+    },
+    path::Path,
     process::{Command, ExitStatus, Stdio},
     sync::atomic::Ordering,
 };
-use tokio::net::UnixListener;
+use tokio::{io::AsyncReadExt, net::UnixListener};
 
-use crate::DEBUG;
-use tokio_vsock::{VsockAddr, VsockStream};
+use crate::{DEBUG, util::ArchivedBootManifest};
+use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 
 const ALL_NS: &[&str] = &[
     "CAP_AUDIT_CONTROL",
@@ -57,6 +68,8 @@ pub fn run() -> anyhow::Result<()> {
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
 ip link set lo up
 "#);
@@ -75,6 +88,7 @@ ip link set lo up
         println!("Bottlefire v0.1.0");
         cmd("cat /proc/version");
     }
+    best_effort_raise_fd_limit();
     let rootfs_offset = cmdline
         .get("bake.rootfs_offset")
         .and_then(|x| x.parse::<u64>().ok())
@@ -149,40 +163,119 @@ ip rule add fwmark 0x64 lookup 100
         panic!("tun2socks exited: {:?}", ret);
     });
 
-    // Setup 9p volume mounts via vsock proxy (host port 12)
-    if let Some(vols) = cmdline
-        .get("bake.volumes")
-        .map(|s| urlencoding::decode(s).unwrap().into_owned())
-        .and_then(|x| serde_json::from_str::<Vec<String>>(&x).ok())
-    {
-        if !vols.is_empty() {
-            setup_9p_volumes(&vols);
-        }
+    // Fetch boot manifest
+    let mut boot_manifest = Vec::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            VsockStream::connect(VsockAddr::new(2, 13))
+                .await?
+                .read_to_end(&mut boot_manifest)
+                .await
+        })?;
+    let boot_manifest = rkyv::access::<ArchivedBootManifest, rkyv::rancor::Error>(&boot_manifest)
+        .with_context(|| "invalid boot request")?;
+
+    if !boot_manifest.volumes.is_empty() {
+        setup_9p_volumes(&boot_manifest.volumes);
     }
 
-    // Parse container runtime arguments
-    let entrypoint = cmdline
-        .get("bake.entrypoint")
-        .map(|s| urlencoding::decode(s).unwrap().into_owned());
-    let args = cmdline
-        .get("bake.args")
-        .map(|s| urlencoding::decode(s).unwrap().into_owned())
-        .and_then(|x| serde_json::from_str::<Vec<String>>(&x).ok())
-        .unwrap_or_default();
-    let env = cmdline
-        .get("bake.env")
-        .map(|s| urlencoding::decode(s).unwrap().into_owned())
-        .and_then(|x| serde_json::from_str::<Vec<String>>(&x).ok())
-        .unwrap_or_default();
-    let cwd = cmdline
-        .get("bake.cwd")
-        .map(|s| urlencoding::decode(s).unwrap().into_owned())
-        .unwrap_or_default();
-    let res = start_container(entrypoint, args, env, cwd)?;
+    std::fs::write(
+        "/etc/ssh/sshd_config",
+        r#"HostKey /etc/ssh/ssh_host_ecdsa_key
+PermitRootLogin without-password
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ForceCommand /ssh.sh
+"#,
+    )
+    .with_context(|| "failed to write sshd_config")?;
+
+    std::fs::write(
+        "/ssh.sh",
+        r#"#!/bin/sh
+set -e
+cd /var/lib/container
+if [ -z "$SSH_TTY" ]; then
+  exec runc exec container1 sh -c "$SSH_ORIGINAL_COMMAND"
+else
+  if [ -z "$SSH_ORIGINAL_COMMAND" ]; then
+    exec runc exec -t container1 sh
+  else
+    exec runc exec -t container1 sh -c "$SSH_ORIGINAL_COMMAND"
+  fi
+fi
+"#,
+    )
+    .with_context(|| "failed to write ssh.sh")?;
+    std::fs::set_permissions("/ssh.sh", Permissions::from_mode(0o555))?;
+
+    std::fs::write(
+        "/etc/ssh/ssh_host_ecdsa_key",
+        boot_manifest.ssh_ecdsa_private_key.as_bytes(),
+    )
+    .with_context(|| "failed to write ssh_host_ecdsa_key")?;
+    std::fs::set_permissions("/etc/ssh/ssh_host_ecdsa_key", Permissions::from_mode(0o600))?;
+    std::fs::create_dir_all("/root/.ssh")?;
+    std::fs::write(
+        "/root/.ssh/authorized_keys",
+        boot_manifest.ssh_ecdsa_public_key.as_bytes(),
+    )
+    .with_context(|| "failed to write authorized_keys")?;
+    std::fs::set_permissions("/root/.ssh/authorized_keys", Permissions::from_mode(0o600))?;
+
+    sshd_vsock(VsockAddr::new(u32::MAX, 22))
+        .with_context(|| "failed to start sshd vsock listener")?;
+
+    let res = start_container(
+        boot_manifest
+            .uid
+            .as_ref()
+            .map(|x| x.to_native())
+            .unwrap_or(0),
+        boot_manifest
+            .gid
+            .as_ref()
+            .map(|x| x.to_native())
+            .unwrap_or(0),
+        boot_manifest.entrypoint.as_ref(),
+        &boot_manifest.args[..],
+        boot_manifest
+            .env
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .chain(
+                std::iter::once(|| "TERM=xterm".to_string())
+                    .filter(|_| !boot_manifest.env.contains_key("TERM"))
+                    .map(|x| x()),
+            ),
+        boot_manifest.cwd.as_deref().unwrap_or_default(),
+    )?;
     if !res.success() {
         eprintln!("exit status: {:?}", res);
     }
-    let _ = std::fs::write("/proc/sysrq-trigger", b"b");
+    // Respect kernel cmdline flag to avoid reboot for debugging
+    if cmdline.contains_key("bake.noreboot") {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("[vminit] bake.noreboot present; holding VM after container exit");
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    } else {
+        unsafe {
+            libc::sync();
+        }
+        if !DEBUG.load(Ordering::Relaxed) {
+            let _ = std::fs::write("/proc/sys/kernel/printk", b"0");
+        }
+        unsafe {
+            libc::reboot(libc::RB_AUTOBOOT);
+        }
+    }
 
     Ok(())
 }
@@ -202,7 +295,7 @@ fn cmd(cmd: &str) {
     );
 }
 
-fn setup_9p_volumes(vols: &Vec<String>) {
+fn setup_9p_volumes(vols: &[ArchivedVolumeManifest]) {
     // Create a lightweight runtime to host listeners; keep it alive.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -214,29 +307,70 @@ fn setup_9p_volumes(vols: &Vec<String>) {
     let base = "/ephemeral/9p-sock";
     let _ = std::fs::create_dir_all(base);
 
-    for (idx, guest_path) in vols.iter().enumerate() {
+    for (idx, vol) in vols.iter().enumerate() {
         let uds_path = format!("{}/vol{}.sock", base, idx);
 
         // Start a unix-to-vsock proxy that writes the guest path prefix
-        let guest_path_clone = guest_path.clone();
         let uds_path_clone = uds_path.clone();
-        rt.block_on(async { start_9p_unix_to_vsock_proxy(&uds_path_clone, &guest_path_clone) })
+        rt.block_on(async { start_9p_unix_to_vsock_proxy(&uds_path_clone, &vol.guest_path) })
             .expect("failed to start unix to vsock proxy");
 
-        // Ensure mountpoint exists under overlay root
-        let mnt_point = format!("/rootfs{}", guest_path);
-        if let Err(e) = std::fs::create_dir_all(&mnt_point) {
-            eprintln!("failed to create mountpoint {}: {:?}", mnt_point, e);
-            continue;
-        }
+        let mount_it = |path: &Path| {
+            nix::mount::mount(
+                Some(uds_path.as_str()),
+                path,
+                Some("9p"),
+                MsFlags::empty(),
+                Some("trans=unix,version=9p2000.L"),
+            )
+            .expect("9p mount failed");
+        };
+        let guest_path = Path::new("/rootfs").join(vol.guest_path.as_str().trim_start_matches('/'));
+        if let Some(host_filename) = vol.host_filename.as_deref() {
+            let filebase = format!("/filebase/{}", idx);
+            let _ = std::fs::create_dir_all(&filebase);
+            mount_it(Path::new(&filebase));
+            if vol.ext4 {
+                let _ = std::fs::create_dir_all(&guest_path);
+                // use mount command - need to set up loop device
+                let status = Command::new("mount")
+                    .arg("-t")
+                    .arg("ext4")
+                    .arg("-o")
+                    .arg(if vol.ro { "ro,relatime" } else { "rw,relatime" })
+                    .arg(format!("{}/{}", filebase, host_filename))
+                    .arg(&guest_path)
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .unwrap();
+                if !status.success() {
+                    panic!("ext4 mount failed: {}", vol.guest_path);
+                }
+            } else {
+                if let Some(parent) = guest_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o000)
+                    .open(&guest_path);
 
-        // Perform the mount using 9p over unix socket
-        // Note: the source is the unix socket path (trans=unix)
-        let mount_cmd = format!(
-            "mount -t 9p -o trans=unix,version=9p2000.L {} {}",
-            uds_path, mnt_point
-        );
-        cmd(&mount_cmd);
+                nix::mount::mount(
+                    Some(format!("{}/{}", filebase, host_filename).as_str()),
+                    guest_path.as_path(),
+                    None::<&str>,
+                    MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .expect("bind mount failed");
+            }
+        } else {
+            let _ = std::fs::create_dir_all(&guest_path);
+            mount_it(&guest_path);
+        }
     }
 
     // Keep runtime alive for the lifetime of the init process
@@ -276,10 +410,12 @@ fn start_9p_unix_to_vsock_proxy(uds_path: &str, guest_path: &str) -> anyhow::Res
 }
 
 fn start_container(
-    entrypoint: Option<String>,
-    args: Vec<String>,
-    env: Vec<String>,
-    cwd: String,
+    uid: u32,
+    gid: u32,
+    entrypoint: Option<impl AsRef<str>>,
+    args: &[impl AsRef<str>],
+    env: impl Iterator<Item = String>,
+    cwd: &str,
 ) -> anyhow::Result<ExitStatus> {
     // Create container directories
     cmd("mkdir -p /var/lib/container");
@@ -288,56 +424,112 @@ fn start_container(
     // Create resolv.conf with Google DNS
     fs::write("/var/lib/container/resolv.conf", "nameserver 8.8.8.8\n")?;
 
-    let env_vars: Vec<String> = if env.is_empty() {
-        vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()]
-    } else {
-        let mut vars =
-            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
-        vars.extend(env);
-        vars
-    };
+    // Create hosts
+    fs::write("/var/lib/container/hosts", "127.0.0.1 localhost\n")?;
+
+    let mut env_vars =
+        vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
+    env_vars.extend(env);
 
     // Determine the process command and args
-    let mut process_args = if let Some(entrypoint) = entrypoint {
-        vec![entrypoint]
+    let mut process_args = if let Some(entrypoint) = &entrypoint {
+        vec![entrypoint.as_ref()]
     } else {
         vec![]
     };
-    process_args.extend(args);
+    process_args.extend(args.iter().map(|x| x.as_ref()));
 
     // Generate OCI runtime spec
-    let spec = generate_oci_spec(&process_args, &env_vars, cwd);
+    let spec = generate_oci_spec(uid, gid, &process_args, &env_vars, cwd);
 
     // Write config.json
     let mut config_file = fs::File::create("/var/lib/container/config.json")?;
     config_file.write_all(serde_json::to_string_pretty(&spec)?.as_bytes())?;
     drop(config_file);
 
+    // Console bridge (vsock CID 2, port 14)
+    let tty = crate::vm_console::start_console_bridge()?;
+
     // Start container with runc (we're already in the bundle directory)
-    let status = Command::new("runc")
-        .arg("run")
+    let mut cmd = Command::new("runc");
+    cmd.arg("run")
         .arg("--no-pivot")
         .arg("container1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+        .stderr(Stdio::inherit());
+    unsafe {
+        let tty_fd = tty.as_raw_fd();
+        cmd.pre_exec(move || {
+            libc::login_tty(tty_fd);
+            Ok(())
+        });
+    }
+    let status = cmd.status()?;
 
     Ok(status)
 }
 
-fn generate_oci_spec(args: &[String], env: &[String], cwd: String) -> serde_json::Value {
+fn sshd_vsock(vsock_listen: VsockAddr) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let sock = rt.block_on(async { VsockListener::bind(vsock_listen) })?;
+    rt.spawn(async move {
+        loop {
+            let Ok((conn, _)) = sock.accept().await else {
+                break;
+            };
+            let mut cmd = Command::new("/usr/sbin/sshd");
+            cmd.arg("-i")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit());
+            set_nonblocking(conn.as_fd(), false).expect("failed to set nonblocking");
+            let fd = conn.as_fd().as_raw_fd();
+            unsafe {
+                let ppid = libc::getpid();
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                        || libc::getppid() != ppid
+                    {
+                        libc::abort();
+                    }
+                    if libc::dup2(fd, 0) < 0 || libc::dup2(fd, 1) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            if let Err(e) = cmd.spawn() {
+                eprintln!("failed to spawn sshd: {:?}", e);
+            }
+        }
+    });
+    std::mem::forget(rt);
+    Ok(())
+}
+
+fn generate_oci_spec(
+    uid: u32,
+    gid: u32,
+    args: &[&str],
+    env: &[String],
+    cwd: &str,
+) -> serde_json::Value {
     json!({
         "ociVersion": "1.0.0",
         "process": {
             "terminal": true,
             "user": {
-                "uid": 0,
-                "gid": 0
+                "uid": uid,
+                "gid": gid
             },
             "args": args,
             "env": env,
-            "cwd": if cwd.is_empty() { "/" } else { cwd.as_str() },
+            "cwd": if cwd.is_empty() { "/" } else { cwd },
             "capabilities": {
                 "bounding": ALL_NS,
                 "effective": ALL_NS,
@@ -416,6 +608,15 @@ fn generate_oci_spec(args: &[String], env: &[String], cwd: String) -> serde_json
                 "destination": "/etc/resolv.conf",
                 "type": "bind",
                 "source": "/var/lib/container/resolv.conf",
+                "options": [
+                    "bind",
+                    "ro"
+                ]
+            },
+            {
+                "destination": "/etc/hosts",
+                "type": "bind",
+                "source": "/var/lib/container/hosts",
                 "options": [
                     "bind",
                     "ro"

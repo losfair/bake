@@ -2,7 +2,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::net::Ipv4Addr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tun::{AsyncDevice, Configuration, Layer};
+use tun::{AsyncDevice, Configuration, DeviceReader, DeviceWriter, Layer};
 
 /// Parsed packet view for convenience when receiving
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -15,7 +15,8 @@ pub struct UdpPacket {
 }
 
 pub struct RawUdp {
-    tun: AsyncDevice,
+    tun_r: tokio::sync::Mutex<DeviceReader>,
+    tun_w: tokio::sync::Mutex<DeviceWriter>,
 }
 
 impl RawUdp {
@@ -42,17 +43,21 @@ impl RawUdp {
                 format!("Failed to create async TUN device: {}", e),
             )
         })?;
+        let (tun_w, tun_r) = tun.split().unwrap();
 
-        Ok(Self { tun })
+        Ok(Self {
+            tun_w: tokio::sync::Mutex::new(tun_w),
+            tun_r: tokio::sync::Mutex::new(tun_r),
+        })
     }
 
     /// Receive one raw IPv4+UDP packet from the TUN device.
     /// Blocks until a packet arrives.
-    pub async fn recv(&mut self) -> Result<UdpPacket> {
+    pub async fn recv(&self) -> Result<UdpPacket> {
         loop {
             // 9600B buffer for raw IPv4 packets
             let mut buf = vec![0u8; 9600];
-            let n = self.tun.read(&mut buf).await?;
+            let n = self.tun_r.lock().await.read(&mut buf).await?;
 
             if n < 20 {
                 // eprintln!("DEBUG: Packet too short: {} bytes, first 16 bytes: {:02x?}", n, &buf[..n.min(16)]);
@@ -115,7 +120,7 @@ impl RawUdp {
     ///
     /// Creates a complete IPv4+UDP packet and writes it to the TUN interface.
     pub async fn inject(
-        &mut self,
+        &self,
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
         src_port: u16,
@@ -172,7 +177,7 @@ impl RawUdp {
         pkt.extend_from_slice(payload);
 
         // Write to TUN device
-        self.tun.write_all(&pkt).await?;
+        self.tun_w.lock().await.write_all(&pkt).await?;
         Ok(())
     }
 }

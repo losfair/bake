@@ -15,16 +15,24 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 fast-socks5 = "0.10"
 faster-hex = "0.10"
+fdlimit = "0.3"
+futures = "0.3"
+landlock = "0.4"
 libc = "0.2"
 memmap2 = "0.9"
 moka = { version = "0.12", features = ["sync"] }
+nix = { version = "0.30", features = ["mount"] }
 p9 = "0.3"
 rand = "0.9"
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 rkyv = { version = "0.8", features = ["bytes-1"] }
 rkyv_derive = "0.8"
 scopeguard = "1"
+shell-escape = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ssh-key = { version = "0.6", features = ["p256"] }
+termion = "4"
 tokio = { version = "1", features = ["full"] }
 tokio-vsock = "0.7"
 tun = { version = "0.8", features = ["async"] }

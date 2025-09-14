@@ -2,7 +2,8 @@ FROM rust:1.89-slim-bullseye AS build_bake
 RUN apt-get update && apt-get install -o Acquire::Retries="5" -y musl-tools python3-pip && python3 -m pip install cargo-zigbuild
 RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 WORKDIR /build
-COPY ./ /build/bake/
+COPY Cargo.toml Cargo.lock /build/bake/
+COPY ./src/ /build/bake/src/
 RUN cd /build/bake && cargo zigbuild --release --target x86_64-unknown-linux-musl && \
   cargo zigbuild --release --target aarch64-unknown-linux-musl && \
   mkdir ../bin && \
@@ -25,7 +26,8 @@ RUN apt-get update && apt-get install -y curl cpio
 WORKDIR /build
 RUN curl -fsSL -o alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.1-x86_64.tar.gz
 RUN mkdir rootfs && cd rootfs && tar xzf ../alpine.tar.gz && cat /etc/resolv.conf > etc/resolv.conf && \
-  chroot . apk add runc device-mapper iproute2 nftables e2fsprogs
+  LD_LIBRARY_PATH=$(pwd)/lib:$(pwd)/usr/lib ./lib/ld-musl-x86_64.so.1 ./sbin/apk add --root . --no-scripts \
+    runc device-mapper iproute2 nftables e2fsprogs openssh
 COPY --from=build_bake /build/bin/bake.amd64 ./rootfs/init
 COPY --from=build_tun2socks /opt/tun2socks.amd64 ./rootfs/usr/bin/tun2socks
 RUN cd rootfs && bash -c "set -euo pipefail; find . | cpio -o --format=newc | gzip > /build/initrd.cpio.gz"
@@ -35,7 +37,8 @@ RUN apt-get update && apt-get install -y curl cpio
 WORKDIR /build
 RUN curl -fsSL -o alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.1-aarch64.tar.gz
 RUN mkdir rootfs && cd rootfs && tar xzf ../alpine.tar.gz && cat /etc/resolv.conf > etc/resolv.conf && \
-  chroot . apk add runc device-mapper iproute2 nftables e2fsprogs
+  LD_LIBRARY_PATH=$(pwd)/lib:$(pwd)/usr/lib ./lib/ld-musl-aarch64.so.1 ./sbin/apk add --root . --no-scripts \
+    runc device-mapper iproute2 nftables e2fsprogs openssh
 COPY --from=build_bake /build/bin/bake.arm64 ./rootfs/init
 COPY --from=build_tun2socks /opt/tun2socks.arm64 ./rootfs/usr/bin/tun2socks
 RUN cd rootfs && bash -c "set -euo pipefail; find . | cpio -o --format=newc | gzip > /build/initrd.cpio.gz"
