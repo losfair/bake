@@ -24,6 +24,7 @@ pub struct Drive {
     pub drive_id: String,
     pub is_root_device: bool,
     pub is_read_only: bool,
+    pub io_engine: String,
     pub path_on_host: String,
 }
 

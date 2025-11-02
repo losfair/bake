@@ -1,14 +1,16 @@
 use std::{
     collections::HashMap,
-    os::fd::{AsRawFd, BorrowedFd},
-    path::Path, sync::atomic::Ordering,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    path::Path,
+    sync::atomic::Ordering,
 };
 
 use fdlimit::Outcome;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    io::{AsyncReadExt, AsyncWriteExt, Interest, unix::AsyncFd},
     net::UnixStream,
 };
+use tokio_vsock::VsockStream;
 
 use crate::DEBUG;
 
@@ -21,6 +23,8 @@ pub struct BootManifest {
     pub volumes: Vec<VolumeManifest>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    pub disable_hostnet: bool,
+    pub wireguard_conf: Option<String>,
     pub ssh_ecdsa_private_key: String,
     pub ssh_ecdsa_public_key: String,
 }
@@ -38,13 +42,9 @@ pub fn align_up(value: usize, align: usize) -> usize {
     (value + (align - 1)) & !(align - 1)
 }
 
-pub async fn vsock_uds_connect(
-    uds_path: &Path,
-    port: u32,
-) -> anyhow::Result<BufStream<UnixStream>> {
+pub async fn vsock_uds_connect(uds_path: &Path, port: u32) -> anyhow::Result<UnixStream> {
     'outer: loop {
-        let stream = UnixStream::connect(uds_path).await?;
-        let mut stream = BufStream::new(stream);
+        let mut stream = UnixStream::connect(uds_path).await?;
         stream
             .write_all(format!("CONNECT {}\n", port).as_bytes())
             .await?;
@@ -134,4 +134,56 @@ pub fn best_effort_raise_fd_limit() {
             eprintln!("failed to raise fd limit: {:?}", e);
         }
     }
+}
+
+pub async fn copy_bidirectional_fastclose(a: OwnedFd, b: OwnedFd) -> std::io::Result<()> {
+    async fn copy<'b>(
+        a: &'b AsyncFd<OwnedFd>,
+        b: &'b AsyncFd<OwnedFd>,
+        drain: bool,
+    ) -> std::io::Result<()> {
+        const BUFFER_SIZE: usize = 8192;
+        let mut buf = vec![0u8; BUFFER_SIZE];
+        loop {
+            let n = if drain {
+                nix::unistd::read(a.get_ref(), &mut buf).map_err(std::io::Error::from)?
+            } else {
+                a.async_io(Interest::READABLE, |x| {
+                    nix::unistd::read(x, &mut buf).map_err(std::io::Error::from)
+                })
+                .await?
+            };
+            if n == 0 {
+                if drain {
+                    unsafe {
+                        libc::shutdown(b.as_raw_fd(), libc::SHUT_WR);
+                    }
+                }
+                return Ok(());
+            }
+            let mut buf = &buf[..n];
+            while !buf.is_empty() {
+                let written = b
+                    .async_io(Interest::WRITABLE, |x| {
+                        nix::unistd::write(x, buf).map_err(std::io::Error::from)
+                    })
+                    .await?;
+                assert!(written > 0);
+                buf = &buf[written..];
+            }
+        }
+    }
+    let a = AsyncFd::with_interest(a, Interest::READABLE | Interest::WRITABLE)?;
+    let b = AsyncFd::with_interest(b, Interest::READABLE | Interest::WRITABLE)?;
+    let ret = tokio::select! {
+      biased;
+      x = copy(&a, &b, false) => x,
+      x = copy(&b, &a, false) => x,
+    };
+    let _ = tokio::join!(copy(&a, &b, true), copy(&b, &a, true));
+    ret
+}
+
+pub fn decompose_vsock_stream(s: VsockStream) -> std::io::Result<OwnedFd> {
+    s.as_fd().try_clone_to_owned()
 }

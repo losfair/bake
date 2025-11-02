@@ -27,7 +27,7 @@ impl RawUdp {
             .tun_name(ifname)
             .layer(Layer::L3)
             .address(address)
-            .mtu(1280)
+            .mtu(1500)
             .up();
 
         let device = tun::create(&config).map_err(|e| {

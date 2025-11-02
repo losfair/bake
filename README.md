@@ -45,7 +45,10 @@ Options:
       --cwd <CWD>                Container working directory [default: ]
   -p, --publish <HOST:VM>        Publish host:vm port forward (e.g. -p 8080:8080)
   -v, --volume <HOST:VM[:ro]>    Directory/volume mappings (e.g. -v ./data:/data)
-  -h, --help                     Print help
+      --allow-net <IPv4|CIDR>    Allow outbound network to IPv4 address or CIDR (repeatable)
+      --disable-hostnet              Disable outbound network bridge
+      --wireguard-conf-file <PATH>  Provide a WireGuard config (wg setconf format)
+      -h, --help                     Print help
 
 Subcommands:
   ssh        Auto-connect to the running microVM via SSH
@@ -163,3 +166,37 @@ $ ./output/app.elf ssh -- -L 8080:localhost:8080 -o ConnectTimeout=5
 ```
 
 If multiple instances are running, it prints their PIDs and exits so you can stop the others and retry.
+
+### Network allowlist
+
+Use `--allow-net` to restrict outbound network destinations from the guest (via the host SOCKS/UDP bridges).
+
+- Without any `--allow-net`, all destinations are allowed (default-allow).
+- Repeat the flag to allow multiple IPv4 addresses.
+- IPv6 is permitted only if it is IPv4-mapped and the mapped IPv4 appears in the allowlist.
+
+Examples:
+
+```bash
+# Allow only 1.2.3.4
+$ ./output/app.elf --allow-net 1.2.3.4 -- curl http://1.2.3.4/
+
+# Allow 1.2.3.4 and 8.8.8.8
+$ ./output/app.elf --allow-net 1.2.3.4 --allow-net 8.8.8.8 -- some_command
+```
+
+To disable proxied outbound network, add `--disable-hostnet`:
+
+```bash
+$ ./output/app.elf --disable-hostnet -- some_command
+```
+
+### WireGuard
+
+Pass a WireGuard config file with `--wireguard-conf-file`. In the guest, the interface `wg0` is created and configured using the `wg` CLI (not `wg-quick`). If the config contains `Address=` entries, they are applied to `wg0`. All `AllowedIPs` entries are parsed and added as routes via `wg0`. If omitted, configure addresses/routes yourself as needed.
+
+Example:
+
+```bash
+$ ./output/app.elf --wireguard-conf-file ./wg.conf -- some_command
+```

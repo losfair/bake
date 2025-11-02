@@ -8,6 +8,7 @@ mod ssh_launcher;
 mod util;
 mod vm_console;
 mod vminit;
+mod wireguard;
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -31,7 +32,10 @@ use tokio::runtime::Runtime;
 use crate::embed::{EmbeddedInfo, get_embedded_data, write_embedded_data};
 use crate::fileshare::spawn_file_server;
 use crate::firecracker::{BootSource, Drive, FirecrackerConfig, MachineConfig, VsockConfig};
-use crate::util::{BootManifest, VolumeManifest, align_up, best_effort_raise_fd_limit};
+use crate::util::{
+    BootManifest, VolumeManifest, align_up, best_effort_raise_fd_limit,
+    copy_bidirectional_fastclose,
+};
 use crate::util::{quote_systemd_string, vsock_uds_connect};
 use crate::vm_console::host_run_console;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -274,6 +278,18 @@ struct RunArgs {
     #[arg(short = 'v', long = "volume", value_name = "HOST:VM[:ro]")]
     volume: Vec<String>,
 
+    /// Allow outbound network to IPv4 address or CIDR (repeatable)
+    #[arg(long = "allow-net")]
+    allow_net: Vec<String>,
+
+    /// Disable outbound network bridge
+    #[arg(long = "disable-hostnet")]
+    disable_hostnet: bool,
+
+    /// WireGuard config file path (wg setconf format)
+    #[arg(long = "wireguard-conf-file")]
+    wireguard_conf_file: Option<PathBuf>,
+
     /// Size of ephemeral disk (in MB) for overlay filesystem [default: 2048]
     #[arg(long, default_value_t = 2048)]
     ephemeral_disk_size: u32,
@@ -351,6 +367,19 @@ fn generate_systemd_unit(args: &RunArgs) -> anyhow::Result<()> {
         service_args.push(format!(
             "--volume {}",
             shell_escape::escape(volume.as_str().into())
+        ));
+    }
+
+    for ip in &args.allow_net {
+        service_args.push(format!("--allow-net {}", ip));
+    }
+    if args.disable_hostnet {
+        service_args.push("--disable-hostnet".into());
+    }
+    if let Some(path) = &args.wireguard_conf_file {
+        service_args.push(format!(
+            "--wireguard-conf-file {}",
+            shell_escape::escape(path.to_string_lossy().into())
         ));
     }
 
@@ -579,8 +608,15 @@ fn run_mode(
     let vsock_inbound_9p = tmp_base_dir.join("fc.sock_12");
     let vsock_inbound_boot_manifest_request = tmp_base_dir.join("fc.sock_13");
     let vsock_inbound_console = tmp_base_dir.join("fc.sock_14");
-    crate::socks5::run_socks5_unix(&vsock_inbound_socks5_uds)
-        .with_context(|| "failed to start socks5 uds listener")?;
+    // Apply network allowlist (if any) for outbound network
+    if !parsed.allow_net.is_empty() || parsed.disable_hostnet {
+        crate::socks5::set_allow_net(parsed.allow_net.clone());
+    }
+
+    if !parsed.disable_hostnet {
+        crate::socks5::run_socks5_unix(&vsock_inbound_socks5_uds)
+            .with_context(|| "failed to start socks5 uds listener")?;
+    }
     crate::socks5::run_socks5_udp_unix(&vsock_inbound_socks5_udp_uds)
         .with_context(|| "failed to start socks5 udp uds listener")?;
     let console_task = host_run_console(RT.get().unwrap(), &vsock_inbound_console)
@@ -601,6 +637,10 @@ fn run_mode(
     } else {
         vec![]
     };
+
+    if volumes.iter().filter(|x| x.ext4).count() > 20 {
+        panic!("too many ext4 volumes, max 20");
+    }
 
     let ssh_ecdsa_private_key = ssh_key::PrivateKey::random(
         &mut rand_core_06::OsRng,
@@ -689,10 +729,51 @@ exec ssh -i {} -o "ProxyCommand nc -U {}" -o "UserKnownHostsFile=/dev/null" -o "
             .collect(),
         uid,
         gid,
+        disable_hostnet: parsed.disable_hostnet,
+        wireguard_conf: if let Some(ref path) = parsed.wireguard_conf_file {
+            Some(
+                std::fs::read_to_string(path)
+                    .with_context(|| "failed to read wireguard conf file")?,
+            )
+        } else {
+            None
+        },
         ssh_ecdsa_private_key,
         ssh_ecdsa_public_key,
     };
     serve_boot_manifest_request(&vsock_inbound_boot_manifest_request, &manifest)?;
+
+    let mut drives = vec![
+        Drive {
+            drive_id: "rootfs".into(),
+            is_root_device: true,
+            is_read_only: true,
+            io_engine: "Async".into(),
+            path_on_host: exe_path,
+        },
+        Drive {
+            drive_id: "ephemeral".into(),
+            is_root_device: false,
+            is_read_only: false,
+            io_engine: "Async".into(),
+            path_on_host: ephemeral_disk
+                .to_str()
+                .expect("invalid ephemeral disk path")
+                .to_string(),
+        },
+    ];
+
+    for (i, vol) in volumes.iter().enumerate() {
+        if vol.ext4 {
+            drives.push(Drive {
+                drive_id: format!("vol-{}", i),
+                is_root_device: false,
+                is_read_only: vol.ro,
+                io_engine: "Async".into(),
+                path_on_host: vol.host.clone(),
+            })
+        }
+    }
 
     {
         // Convert MB to bytes
@@ -713,23 +794,7 @@ exec ssh -i {} -o "ProxyCommand nc -U {}" -o "UserKnownHostsFile=/dev/null" -o "
             initrd_path,
             boot_args,
         },
-        drives: vec![
-            Drive {
-                drive_id: "rootfs".into(),
-                is_root_device: true,
-                is_read_only: true,
-                path_on_host: exe_path,
-            },
-            Drive {
-                drive_id: "ephemeral".into(),
-                is_root_device: false,
-                is_read_only: false,
-                path_on_host: ephemeral_disk
-                    .to_str()
-                    .expect("invalid ephemeral disk path")
-                    .to_string(),
-            },
-        ],
+        drives,
         machine_config: MachineConfig {
             vcpu_count: cpus,
             mem_size_mib: *memory,
@@ -854,7 +919,7 @@ async fn forward_listener(
     let bind_addr = std::net::SocketAddr::new(bind_ip, host_port);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     loop {
-        let (mut inbound, _) = listener.accept().await?;
+        let (inbound, _) = listener.accept().await?;
         let uds_path = Path::new(uds_path).to_path_buf();
         tokio::spawn(async move {
             match vsock_uds_connect(&uds_path, 10).await {
@@ -904,8 +969,16 @@ async fn forward_listener(
                         return;
                     }
 
+                    let Ok(inbound) = inbound.into_std() else {
+                        return;
+                    };
+                    let Ok(stream) = stream.into_std() else {
+                        return;
+                    };
                     // Pipe data both ways
-                    if let Err(e) = tokio::io::copy_bidirectional(&mut inbound, &mut stream).await {
+                    if let Err(e) =
+                        copy_bidirectional_fastclose(inbound.into(), stream.into()).await
+                    {
                         eprintln!("forward connection failed: {:?}", e);
                     }
                 }
@@ -981,15 +1054,21 @@ fn serve_ssh_proxy(path: &Path, vsock_outbound_uds: &Path) -> anyhow::Result<()>
     let vsock_outbound_uds = Arc::new(vsock_outbound_uds.to_path_buf());
     RT.get().unwrap().spawn(async move {
         loop {
-            let Ok((mut conn, _)) = listener.accept().await else {
+            let Ok((conn, _)) = listener.accept().await else {
                 break;
             };
             let vsock_outbound_uds = vsock_outbound_uds.clone();
             tokio::spawn(async move {
-                let Ok(mut outbound) = vsock_uds_connect(&vsock_outbound_uds, 22).await else {
+                let Ok(outbound) = vsock_uds_connect(&vsock_outbound_uds, 22).await else {
                     return;
                 };
-                let _ = tokio::io::copy_bidirectional(&mut conn, &mut outbound).await;
+                let Ok(conn) = conn.into_std() else {
+                    return;
+                };
+                let Ok(outbound) = outbound.into_std() else {
+                    return;
+                };
+                let _ = copy_bidirectional_fastclose(conn.into(), outbound.into()).await;
             });
         }
     });

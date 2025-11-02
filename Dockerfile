@@ -27,7 +27,7 @@ WORKDIR /build
 RUN curl -fsSL -o alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.1-x86_64.tar.gz
 RUN mkdir rootfs && cd rootfs && tar xzf ../alpine.tar.gz && cat /etc/resolv.conf > etc/resolv.conf && \
   LD_LIBRARY_PATH=$(pwd)/lib:$(pwd)/usr/lib ./lib/ld-musl-x86_64.so.1 ./sbin/apk add --root . --no-scripts \
-    runc device-mapper iproute2 nftables e2fsprogs openssh
+    runc device-mapper iproute2 nftables e2fsprogs openssh wireguard-tools
 COPY --from=build_bake /build/bin/bake.amd64 ./rootfs/init
 COPY --from=build_tun2socks /opt/tun2socks.amd64 ./rootfs/usr/bin/tun2socks
 RUN cd rootfs && bash -c "set -euo pipefail; find . | cpio -o --format=newc | gzip > /build/initrd.cpio.gz"
@@ -38,7 +38,7 @@ WORKDIR /build
 RUN curl -fsSL -o alpine.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.1-aarch64.tar.gz
 RUN mkdir rootfs && cd rootfs && tar xzf ../alpine.tar.gz && cat /etc/resolv.conf > etc/resolv.conf && \
   LD_LIBRARY_PATH=$(pwd)/lib:$(pwd)/usr/lib ./lib/ld-musl-aarch64.so.1 ./sbin/apk add --root . --no-scripts \
-    runc device-mapper iproute2 nftables e2fsprogs openssh
+    runc device-mapper iproute2 nftables e2fsprogs openssh wireguard-tools
 COPY --from=build_bake /build/bin/bake.arm64 ./rootfs/init
 COPY --from=build_tun2socks /opt/tun2socks.arm64 ./rootfs/usr/bin/tun2socks
 RUN cd rootfs && bash -c "set -euo pipefail; find . | cpio -o --format=newc | gzip > /build/initrd.cpio.gz"

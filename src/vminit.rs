@@ -1,11 +1,16 @@
-use crate::util::{ArchivedVolumeManifest, best_effort_raise_fd_limit, set_nonblocking};
+use crate::util::{
+    ArchivedVolumeManifest, best_effort_raise_fd_limit, copy_bidirectional_fastclose,
+    decompose_vsock_stream, set_nonblocking,
+};
 use anyhow::Context;
 use nix::mount::MsFlags;
 use serde_json::json;
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::{self, OpenOptions, Permissions},
     io::Write,
+    net::{IpAddr, SocketAddr},
     os::{
         fd::{AsFd, AsRawFd},
         unix::{
@@ -15,6 +20,7 @@ use std::{
     },
     path::Path,
     process::{Command, ExitStatus, Stdio},
+    str::FromStr,
     sync::atomic::Ordering,
 };
 use tokio::{io::AsyncReadExt, net::UnixListener};
@@ -115,54 +121,6 @@ mount -t overlay -o rw,lowerdir=/rootfs.base,upperdir=/ephemeral/rootfs.overlay/
         cmd("ls /dev; mount");
     }
 
-    // start socks5 server
-    crate::socks5::run_socks5_vsock().expect("failed to start socks5 server");
-
-    // proxy socks5 to host
-    crate::socks5::run_socks5_tcp_to_vsock_proxy().expect("failed to start socks5 host proxy");
-
-    // start tun2socks
-    cmd(r#"set -e
-ip tuntap add mode tun dev hostnet
-ip addr add 198.18.0.1/32 dev hostnet
-ip link set dev hostnet up
-ip route add default dev hostnet
-"#);
-
-    crate::socks5::run_socks5_udp_injection("hostudp").expect("failed to start udp injection task");
-    cmd(r#"set -e
-ip route add default dev hostudp table 100
-nft add table inet mangle
-nft 'add chain inet mangle output { type route hook output priority mangle; }'
-nft 'add rule inet mangle output meta l4proto udp meta mark set 0x64'
-ip rule add fwmark 0x64 lookup 100
-"#);
-
-    let mut tun2socks = Command::new("/usr/bin/tun2socks")
-        .arg("-device")
-        .arg("hostnet")
-        .arg("-proxy")
-        .arg("socks5://127.0.0.10:10")
-        .arg("-interface")
-        .arg("lo")
-        .stdin(Stdio::null())
-        .stdout(if quiet {
-            Stdio::null()
-        } else {
-            Stdio::inherit()
-        })
-        .stderr(if quiet {
-            Stdio::null()
-        } else {
-            Stdio::inherit()
-        })
-        .spawn()
-        .unwrap();
-    std::thread::spawn(move || {
-        let ret = tun2socks.wait();
-        panic!("tun2socks exited: {:?}", ret);
-    });
-
     // Fetch boot manifest
     let mut boot_manifest = Vec::new();
     tokio::runtime::Builder::new_current_thread()
@@ -177,6 +135,138 @@ ip rule add fwmark 0x64 lookup 100
         })?;
     let boot_manifest = rkyv::access::<ArchivedBootManifest, rkyv::rancor::Error>(&boot_manifest)
         .with_context(|| "invalid boot request")?;
+
+    // start socks5 server
+    crate::socks5::run_socks5_vsock().expect("failed to start socks5 server");
+
+    // proxy socks5 to host
+    crate::socks5::run_socks5_tcp_to_vsock_proxy().expect("failed to start socks5 host proxy");
+
+    crate::socks5::run_socks5_udp_injection("hostudp").expect("failed to start udp injection task");
+    if !boot_manifest.disable_hostnet {
+        // configure udp routing and start tun2socks
+        cmd(r#"set -e
+ip route add default dev hostudp table 100
+nft add table inet mangle
+nft 'add chain inet mangle output { type route hook output priority mangle; }'
+nft 'add rule inet mangle output meta l4proto udp meta mark set 0x64'
+ip rule add preference 100 fwmark 0x64 lookup 100
+
+ip tuntap add mode tun dev hostnet
+ip addr add 198.18.0.1/32 dev hostnet
+ip link set dev hostnet up
+ip route add default dev hostnet
+      "#);
+        let mut tun2socks = Command::new("/usr/bin/tun2socks")
+            .arg("-device")
+            .arg("hostnet")
+            .arg("-proxy")
+            .arg("socks5://127.0.0.10:10")
+            .arg("-interface")
+            .arg("lo")
+            .stdin(Stdio::null())
+            .stdout(if quiet {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            })
+            .stderr(if quiet {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            })
+            .spawn()
+            .unwrap();
+        std::thread::spawn(move || {
+            let ret = tun2socks.wait();
+            panic!("tun2socks exited: {:?}", ret);
+        });
+    }
+
+    // Configure WireGuard if provided by host
+    if let Some(conf) = boot_manifest.wireguard_conf.as_deref() {
+        std::fs::write("/ephemeral/wg.conf", conf).expect("failed to write wg.conf");
+        let parsed = crate::wireguard::parse_wireguard_conf(conf);
+        let sanitized = crate::wireguard::serialize_without_keys(&parsed, &["address", "dns"]);
+        std::fs::write("/ephemeral/wg.setconf", sanitized).expect("failed to write wg.setconf");
+        use std::collections::BTreeSet;
+        let mut addr_set = BTreeSet::new();
+        let mut allowed_set = BTreeSet::new();
+        let mut endpoints = BTreeSet::new();
+        for sec in &parsed.sections {
+            if sec.name.eq_ignore_ascii_case("interface") {
+                for (k, v) in &sec.items {
+                    if k.eq_ignore_ascii_case("address") {
+                        for item in v {
+                            addr_set.insert(item.clone());
+                        }
+                    }
+                }
+            } else if sec.name.eq_ignore_ascii_case("peer") {
+                for (k, v) in &sec.items {
+                    if k.eq_ignore_ascii_case("allowedips") {
+                        for item in v {
+                            allowed_set.insert(item.clone());
+                        }
+                    }
+                    if k.eq_ignore_ascii_case("endpoint") {
+                        for item in v {
+                            endpoints.insert(item.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // Create interface, apply config, assign addresses, bring up
+        cmd("ip link add dev wg0 mtu 1280 type wireguard");
+        cmd("wg setconf wg0 /ephemeral/wg.setconf");
+        for addr in addr_set {
+            cmd(&format!(
+                "ip addr add {} dev wg0",
+                shell_escape::escape(addr.into())
+            ));
+        }
+        cmd("ip link set up dev wg0");
+        for cidr in allowed_set {
+            // Use -4/-6 depending on address family for clarity
+            if cidr.contains(':') {
+                cmd(&format!(
+                    "ip -6 route add {} dev wg0 table 99",
+                    shell_escape::escape(cidr.into())
+                ));
+            } else {
+                cmd(&format!(
+                    "ip -4 route add {} dev wg0 table 99",
+                    shell_escape::escape(cidr.into())
+                ));
+            }
+        }
+        for endpoint in endpoints {
+            let Ok(addr) = SocketAddr::from_str(&endpoint) else {
+                continue;
+            };
+            let IpAddr::V4(ip) = addr.ip() else {
+                continue;
+            };
+            let status = Command::new("/sbin/ip")
+                .arg("route")
+                .arg("add")
+                .arg(ip.to_string())
+                .arg("dev")
+                .arg("hostudp")
+                .arg("table")
+                .arg("99")
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .unwrap();
+            if !status.success() {
+                panic!("ip route add dev hostudp failed");
+            }
+        }
+        cmd("ip rule add preference 99 from all lookup 99");
+    }
 
     if !boot_manifest.volumes.is_empty() {
         setup_9p_volumes(&boot_manifest.volumes);
@@ -307,6 +397,8 @@ fn setup_9p_volumes(vols: &[ArchivedVolumeManifest]) {
     let base = "/ephemeral/9p-sock";
     let _ = std::fs::create_dir_all(base);
 
+    let mut vd_names = ('c'..='z').map(|x| format!("/dev/vd{}", x));
+
     for (idx, vol) in vols.iter().enumerate() {
         let uds_path = format!("{}/vol{}.sock", base, idx);
 
@@ -327,18 +419,15 @@ fn setup_9p_volumes(vols: &[ArchivedVolumeManifest]) {
         };
         let guest_path = Path::new("/rootfs").join(vol.guest_path.as_str().trim_start_matches('/'));
         if let Some(host_filename) = vol.host_filename.as_deref() {
-            let filebase = format!("/filebase/{}", idx);
-            let _ = std::fs::create_dir_all(&filebase);
-            mount_it(Path::new(&filebase));
             if vol.ext4 {
                 let _ = std::fs::create_dir_all(&guest_path);
-                // use mount command - need to set up loop device
+                let vd = vd_names.next().expect("too many ext4 volumes");
                 let status = Command::new("mount")
                     .arg("-t")
                     .arg("ext4")
                     .arg("-o")
                     .arg(if vol.ro { "ro,relatime" } else { "rw,relatime" })
-                    .arg(format!("{}/{}", filebase, host_filename))
+                    .arg(vd)
                     .arg(&guest_path)
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
@@ -349,6 +438,9 @@ fn setup_9p_volumes(vols: &[ArchivedVolumeManifest]) {
                     panic!("ext4 mount failed: {}", vol.guest_path);
                 }
             } else {
+                let filebase = format!("/filebase/{}", idx);
+                let _ = std::fs::create_dir_all(&filebase);
+                mount_it(Path::new(&filebase));
                 if let Some(parent) = guest_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -382,7 +474,7 @@ fn start_9p_unix_to_vsock_proxy(uds_path: &str, guest_path: &str) -> anyhow::Res
     let guest_path = guest_path.to_string();
     tokio::spawn(async move {
         loop {
-            let Ok((mut inbound, _)) = listener.accept().await else {
+            let Ok((inbound, _)) = listener.accept().await else {
                 break;
             };
             let guest_path = guest_path.clone();
@@ -401,7 +493,14 @@ fn start_9p_unix_to_vsock_proxy(uds_path: &str, guest_path: &str) -> anyhow::Res
                 <VsockStream as tokio::io::AsyncWriteExt>::write_all(&mut outbound, name_bytes)
                     .await?;
 
-                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                let e = copy_bidirectional_fastclose(
+                    inbound.into_std()?.into(),
+                    decompose_vsock_stream(outbound)?,
+                )
+                .await;
+                if let Err(e) = e {
+                    eprintln!("9p proxy error: {:?}", e);
+                }
                 Ok::<_, anyhow::Error>(())
             });
         }

@@ -117,6 +117,9 @@ fn serve_conn(conn: UnixStream, volumes: Arc<Vec<VolumeSpec>>) -> anyhow::Result
         .iter()
         .find(|x| x.guest.as_bytes() == name)
         .ok_or_else(|| anyhow::anyhow!("requested volume not found"))?;
+    if volume.ext4 {
+        anyhow::bail!("ext4 volumes must not be mounted through 9pfs");
+    }
     let abi = landlock::ABI::V2;
     let ruleset = Ruleset::default().handle_access(AccessFs::from_all(abi))?;
     let status = ruleset

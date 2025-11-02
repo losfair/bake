@@ -1,5 +1,6 @@
 use std::{
-    net::{IpAddr, SocketAddr, SocketAddrV4},
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     os::fd::{AsFd, OwnedFd},
     path::Path,
     sync::{Arc, LazyLock, atomic::Ordering},
@@ -13,7 +14,7 @@ use fast_socks5::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Interest, unix::AsyncFd},
-    net::{TcpListener, TcpStream, UdpSocket, UnixListener},
+    net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
     sync::{OnceCell, broadcast},
 };
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
@@ -21,10 +22,81 @@ use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 use crate::{
     DEBUG,
     raw_udp::{ArchivedUdpPacket, RawUdp, UdpPacket},
+    util::{copy_bidirectional_fastclose, decompose_vsock_stream},
 };
 
 static UDPBUS_RX: LazyLock<broadcast::Sender<UdpPacket>> =
     LazyLock::new(|| broadcast::Sender::new(128));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Ipv4Cidr {
+    network: u32,
+    prefix: u8,
+}
+
+impl Ipv4Cidr {
+    fn mask(prefix: u8) -> u32 {
+        if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix as u32)
+        }
+    }
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        let ip_u = u32::from(ip);
+        let m = Self::mask(self.prefix);
+        (ip_u & m) == (self.network & m)
+    }
+}
+
+fn parse_ipv4_cidr_or_addr(s: &str) -> Option<Ipv4Cidr> {
+    if let Some((ip_s, pref_s)) = s.split_once('/') {
+        let ip = ip_s.parse::<Ipv4Addr>().ok()?;
+        let prefix = pref_s.parse::<u8>().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        let m = Ipv4Cidr::mask(prefix);
+        let net = u32::from(ip) & m;
+        Some(Ipv4Cidr {
+            network: net,
+            prefix,
+        })
+    } else {
+        let ip = s.parse::<Ipv4Addr>().ok()?;
+        Some(Ipv4Cidr {
+            network: u32::from(ip),
+            prefix: 32,
+        })
+    }
+}
+
+// Outbound network allowlist (IPv4 CIDRs). Empty/None means allow all.
+static ALLOW_NET: OnceCell<Arc<HashSet<Ipv4Cidr>>> = OnceCell::const_new();
+
+pub fn set_allow_net(entries: Vec<String>) {
+    let mut set: HashSet<Ipv4Cidr> = HashSet::new();
+    for e in entries {
+        if let Some(c) = parse_ipv4_cidr_or_addr(e.trim()) {
+            set.insert(c);
+        } else if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("invalid --allow-net entry, ignoring: {}", e);
+        }
+    }
+    let _ = ALLOW_NET.set(Arc::new(set));
+}
+
+fn ip_allowed(ip: IpAddr) -> bool {
+    match ALLOW_NET.get() {
+        None => true,
+        Some(set) => match ip {
+            IpAddr::V4(v4) => set.iter().any(|c| c.contains(v4)),
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(false, |v4| set.iter().any(|c| c.contains(v4))),
+        },
+    }
+}
 
 pub fn run_socks5_unix(uds_path: &Path) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -39,13 +111,14 @@ pub fn run_socks5_unix(uds_path: &Path) -> anyhow::Result<()> {
             let Ok((conn, _)) = listener.accept().await else {
                 break;
             };
-            let Ok(sockfd) = conn.as_fd().try_clone_to_owned() else {
-                continue;
-            };
-
             tokio::spawn(async move {
-                if let Err(e) = serve(conn, sockfd, serve_socks5).await {
-                    eprintln!("run_socks5_unix: {:?}", e);
+                let Ok(conn) = conn.into_std() else {
+                    return;
+                };
+                if let Err(e) = serve_socks5(conn.into()).await {
+                    if DEBUG.load(Ordering::Relaxed) {
+                        eprintln!("run_socks5_unix: {:?}", e);
+                    }
                 }
             });
         }
@@ -95,11 +168,11 @@ pub fn run_socks5_vsock() -> anyhow::Result<()> {
             let Ok((conn, _)) = listener.accept().await else {
                 break;
             };
-            let Ok(sockfd) = conn.as_fd().try_clone_to_owned() else {
-                continue;
-            };
             tokio::spawn(async move {
-                if let Err(e) = serve(conn, sockfd, serve_socks5).await {
+                let Ok(conn) = decompose_vsock_stream(conn) else {
+                    return;
+                };
+                if let Err(e) = serve_socks5(conn).await {
                     eprintln!("run_socks5_vsock: {:?}", e);
                 }
             });
@@ -119,7 +192,7 @@ pub fn run_socks5_tcp_to_vsock_proxy() -> anyhow::Result<()> {
     let listener = rt.block_on(async { TcpListener::bind("127.0.0.10:10").await })?;
     rt.spawn(async move {
         loop {
-            let Ok((mut conn, _)) = listener.accept().await else {
+            let Ok((conn, _)) = listener.accept().await else {
                 break;
             };
             tokio::spawn(async move {
@@ -128,10 +201,16 @@ pub fn run_socks5_tcp_to_vsock_proxy() -> anyhow::Result<()> {
                   _ = conn.ready(Interest::PRIORITY) => return,
                   x = VsockStream::connect(VsockAddr::new(2, 10)) => x,
                 };
-                let Ok(mut outbound) = outbound else {
+                let Ok(outbound) = outbound else {
                     return;
                 };
-                let _ = tokio::io::copy_bidirectional(&mut conn, &mut outbound).await;
+                let Ok(outbound) = decompose_vsock_stream(outbound) else {
+                    return;
+                };
+                let Ok(conn) = conn.into_std() else {
+                    return;
+                };
+                let _ = copy_bidirectional_fastclose(conn.into(), outbound).await;
             });
         }
     });
@@ -221,7 +300,7 @@ async fn serve<
     }
 }
 
-async fn serve_socks5(conn: impl AsyncRead + AsyncWrite + Unpin + 'static) -> anyhow::Result<()> {
+async fn serve_socks5(conn: OwnedFd) -> anyhow::Result<()> {
     static CONFIG: OnceCell<Arc<Config<AcceptAuthentication>>> = OnceCell::const_new();
     let config = CONFIG
         .get_or_init(|| async {
@@ -231,6 +310,7 @@ async fn serve_socks5(conn: impl AsyncRead + AsyncWrite + Unpin + 'static) -> an
             Arc::new(config)
         })
         .await;
+    let conn = UnixStream::from_std(std::os::unix::net::UnixStream::from(conn))?;
     let sock = Socks5Socket::new(conn, config.clone());
     let sock = sock.upgrade_to_socks5().await?;
     match sock.cmd() {
@@ -245,11 +325,24 @@ async fn serve_socks5(conn: impl AsyncRead + AsyncWrite + Unpin + 'static) -> an
                 },
                 _ => anyhow::bail!("invalid target addr"),
             };
+            // Check allowlist before proceeding
+            if !ip_allowed(target_addr.ip()) {
+                if DEBUG.load(Ordering::Relaxed) {
+                    eprintln!("TCP blocked by allowlist: {}", target_addr);
+                }
+                let mut sock = sock.into_inner();
+                sock.write_all(&new_reply(&ReplyError::ConnectionNotAllowed, target_addr))
+                    .await?;
+                return Ok(());
+            }
             let mut sock = sock.into_inner();
             sock.write_all(&new_reply(&ReplyError::Succeeded, target_addr))
                 .await?;
-            let mut outbound = TcpStream::connect(target_addr).await?;
-            tokio::io::copy_bidirectional(&mut sock, &mut outbound).await?;
+            let sock = sock.into_std()?;
+            let outbound = TcpStream::connect(target_addr).await?;
+            outbound.set_nodelay(true)?;
+
+            let _ = copy_bidirectional_fastclose(sock.into(), outbound.into_std()?.into()).await;
         }
         _ => {}
     }
@@ -283,6 +376,17 @@ async fn serve_socks5_udp(
                     anyhow::anyhow!("failed to create host udp socket: {:?}", e)
                 })?
                 .0;
+            // Allowlist check for UDP destination
+            if !ip_allowed(IpAddr::V4(packet.dst_ip.as_ipv4())) {
+                if DEBUG.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "UDP blocked by allowlist: {}:{}",
+                        packet.dst_ip.as_ipv4(),
+                        packet.dst_port.to_native()
+                    );
+                }
+                continue;
+            }
             socket
                 .send_to(
                     &packet.payload,
