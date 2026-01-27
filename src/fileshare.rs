@@ -7,6 +7,8 @@ use std::{
 };
 
 use anyhow::Context;
+
+#[cfg(target_os = "linux")]
 use landlock::{
     Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
 };
@@ -120,23 +122,35 @@ fn serve_conn(conn: UnixStream, volumes: Arc<Vec<VolumeSpec>>) -> anyhow::Result
     if volume.ext4 {
         anyhow::bail!("ext4 volumes must not be mounted through 9pfs");
     }
-    let abi = landlock::ABI::V2;
-    let ruleset = Ruleset::default().handle_access(AccessFs::from_all(abi))?;
-    let status = ruleset
-        .create()?
-        .add_rules(path_beneath_rules(
-            [volume.host.as_str()],
-            if volume.ro {
-                AccessFs::from_read(abi)
-            } else {
-                AccessFs::from_all(abi)
-            },
-        ))?
-        .restrict_self()
-        .expect("Failed to enforce ruleset");
 
-    if status.ruleset != RulesetStatus::FullyEnforced {
-        anyhow::bail!("Landlock V2 is not supported by the running kernel.");
+    // Apply landlock sandboxing on Linux
+    #[cfg(target_os = "linux")]
+    {
+        let abi = landlock::ABI::V2;
+        let ruleset = Ruleset::default().handle_access(AccessFs::from_all(abi))?;
+        let status = ruleset
+            .create()?
+            .add_rules(path_beneath_rules(
+                [volume.host.as_str()],
+                if volume.ro {
+                    AccessFs::from_read(abi)
+                } else {
+                    AccessFs::from_all(abi)
+                },
+            ))?
+            .restrict_self()
+            .expect("Failed to enforce ruleset");
+
+        if status.ruleset != RulesetStatus::FullyEnforced {
+            anyhow::bail!("Landlock V2 is not supported by the running kernel.");
+        }
+    }
+
+    // On macOS, we don't have landlock, so we skip sandboxing for now.
+    // The guest VM is already isolated, so this is acceptable.
+    #[cfg(target_os = "macos")]
+    {
+        // Note: Consider using macOS sandbox-exec or App Sandbox in the future
     }
 
     let host_path = Path::new(&volume.host);

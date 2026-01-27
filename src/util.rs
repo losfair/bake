@@ -10,6 +10,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Interest, unix::AsyncFd},
     net::UnixStream,
 };
+
+#[cfg(target_os = "linux")]
 use tokio_vsock::VsockStream;
 
 use crate::DEBUG;
@@ -184,6 +186,15 @@ pub async fn copy_bidirectional_fastclose(a: OwnedFd, b: OwnedFd) -> std::io::Re
     ret
 }
 
+#[cfg(target_os = "linux")]
 pub fn decompose_vsock_stream(s: VsockStream) -> std::io::Result<OwnedFd> {
     s.as_fd().try_clone_to_owned()
+}
+
+#[cfg(target_os = "macos")]
+pub fn decompose_vsock_stream(s: UnixStream) -> std::io::Result<OwnedFd> {
+    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::io::FromRawFd;
+    let std_stream = s.into_std()?;
+    Ok(unsafe { OwnedFd::from_raw_fd(std_stream.into_raw_fd()) })
 }

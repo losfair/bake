@@ -1,5 +1,12 @@
+//! SSH launcher for connecting to running bake instances.
+//!
+//! On Linux, this uses /proc to find running instances and their SSH socket/key fds.
+//! On macOS, this functionality is limited and requires explicit paths.
+
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(target_os = "linux")]
 pub fn launch_ssh(sel_pid: Option<i32>, ssh_args: Vec<String>) -> anyhow::Result<()> {
     use std::fs;
     use std::os::unix::process::CommandExt as _;
@@ -128,6 +135,58 @@ pub fn launch_ssh(sel_pid: Option<i32>, ssh_args: Vec<String>) -> anyhow::Result
     ));
     cmd.arg("-i")
         .arg(format!("/proc/{}/fd/{}", c.pid, c.id_ecdsa_fd));
+    cmd.arg("-o").arg("UserKnownHostsFile=/dev/null");
+    cmd.arg("-o").arg("StrictHostKeyChecking=no");
+    cmd.arg("root@localhost");
+    if !ssh_args.is_empty() {
+        cmd.args(ssh_args);
+    }
+
+    Err(anyhow::anyhow!("exec failed: {:?}", cmd.exec()))
+}
+
+#[cfg(target_os = "macos")]
+pub fn launch_ssh(_sel_pid: Option<i32>, ssh_args: Vec<String>) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    // On macOS, we don't have /proc filesystem to introspect running processes.
+    // Users need to use the SSH script/socket paths provided when starting the VM.
+    //
+    // Check for BAKE_SSH_SOCK_PATH and BAKE_SSH_PRIVATE_KEY_PATH environment variables.
+    let ssh_sock_path = std::env::var("BAKE_SSH_SOCK_PATH")
+        .or_else(|_| {
+            // Try to find in temp directory (use /tmp on macOS for shorter paths)
+            let tmp = std::path::PathBuf::from("/tmp");
+            let found = std::fs::read_dir(&tmp).ok().and_then(|entries| {
+                for entry in entries {
+                    let Ok(entry) = entry else { continue };
+                    let name = entry.file_name();
+                    let Some(name_str) = name.to_str() else { continue };
+                    // Look for bake-*/ssh.sock
+                    if name_str.starts_with("bake-") {
+                        let ssh_sock = entry.path().join("ssh.sock");
+                        if ssh_sock.exists() {
+                            return Some(ssh_sock.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                None
+            });
+            found.ok_or_else(|| std::env::VarError::NotPresent)
+        })
+        .map_err(|_| anyhow::anyhow!("BAKE_SSH_SOCK_PATH not set"))?;
+
+    let ssh_key_path = std::env::var("BAKE_SSH_PRIVATE_KEY_PATH")
+        .map_err(|_| anyhow::anyhow!("BAKE_SSH_PRIVATE_KEY_PATH not set - required on macOS"))?;
+
+    eprintln!("Connecting via SSH socket: {}", ssh_sock_path);
+
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.arg("-o").arg(format!(
+        "ProxyCommand=nc -U {}",
+        shell_escape::escape(std::borrow::Cow::Borrowed(&ssh_sock_path))
+    ));
+    cmd.arg("-i").arg(&ssh_key_path);
     cmd.arg("-o").arg("UserKnownHostsFile=/dev/null");
     cmd.arg("-o").arg("StrictHostKeyChecking=no");
     cmd.arg("root@localhost");

@@ -4,6 +4,7 @@ RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 WORKDIR /build
 COPY Cargo.toml Cargo.lock /build/bake/
 COPY ./src/ /build/bake/src/
+COPY ./rust-p9/ /build/bake/rust-p9/
 RUN cd /build/bake && cargo zigbuild --release --target x86_64-unknown-linux-musl && \
   cargo zigbuild --release --target aarch64-unknown-linux-musl && \
   mkdir ../bin && \
@@ -91,8 +92,8 @@ RUN apt-get update && apt-get install -y curl
 WORKDIR /opt
 RUN curl -fsSL -o firecracker-v1.13.1-x86_64.tgz https://github.com/firecracker-microvm/firecracker/releases/download/v1.13.1/firecracker-v1.13.1-x86_64.tgz && \
   curl -fsSL -o firecracker-v1.13.1-aarch64.tgz https://github.com/firecracker-microvm/firecracker/releases/download/v1.13.1/firecracker-v1.13.1-aarch64.tgz && \
-  tar xzf firecracker-v1.13.1-x86_64.tgz && \
-  tar xzf firecracker-v1.13.1-aarch64.tgz && \
+  tar xzf firecracker-v1.13.1-x86_64.tgz --no-same-owner && \
+  tar xzf firecracker-v1.13.1-aarch64.tgz --no-same-owner && \
   mv release-v1.13.1-x86_64/firecracker-v1.13.1-x86_64 ./firecracker.amd64 && \
   mv release-v1.13.1-aarch64/firecracker-v1.13.1-aarch64 ./firecracker.arm64
 

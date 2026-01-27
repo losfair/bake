@@ -79,15 +79,13 @@ mount -t devpts devpts /dev/pts
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
 ip link set lo up
 "#);
-    let cmdline = Box::leak(
-        std::fs::read_to_string("/proc/cmdline")
-            .unwrap()
-            .into_boxed_str(),
-    )
-    .split(' ')
-    .filter(|x| !x.is_empty())
-    .map(|x| x.split_once('=').unwrap_or((x, "")))
-    .collect::<HashMap<&'static str, &'static str>>();
+    let cmdline_raw = std::fs::read_to_string("/proc/cmdline").unwrap();
+    eprintln!("[DEBUG] /proc/cmdline: {:?}", cmdline_raw);
+    let cmdline = Box::leak(cmdline_raw.into_boxed_str())
+        .split(' ')
+        .filter(|x| !x.is_empty())
+        .map(|x| x.trim().split_once('=').unwrap_or((x, "")))
+        .collect::<HashMap<&'static str, &'static str>>();
     let quiet = cmdline.contains_key("quiet");
     if !quiet {
         DEBUG.store(true, Ordering::Relaxed);

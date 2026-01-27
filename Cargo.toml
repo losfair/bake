@@ -8,6 +8,9 @@ panic = "abort"
 opt-level = "z"
 lto = "thin"
 
+[features]
+default = []
+
 [dependencies]
 anyhow = "1"
 bytes = "1"
@@ -17,12 +20,11 @@ fast-socks5 = "0.10"
 faster-hex = "0.10"
 fdlimit = "0.3"
 futures = "0.3"
-landlock = "0.4"
 libc = "0.2"
 memmap2 = "0.9"
 moka = { version = "0.12", features = ["sync"] }
 nix = { version = "0.30", features = ["mount"] }
-p9 = "0.3"
+p9 = { path = "rust-p9" }
 rand = "0.9"
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 rkyv = { version = "0.8", features = ["bytes-1"] }
@@ -34,6 +36,17 @@ serde_json = "1"
 ssh-key = { version = "0.6", features = ["p256"] }
 termion = "4"
 tokio = { version = "1", features = ["full"] }
+urlencoding = "2"
+
+# Linux-specific dependencies
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
 tokio-vsock = "0.7"
 tun = { version = "0.8", features = ["async"] }
-urlencoding = "2"
+
+# macOS-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSError", "NSString", "NSURL", "NSValue", "NSFileHandle"] }
+block2 = "0.5"
+tempfile = "3"

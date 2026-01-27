@@ -1,5 +1,12 @@
+//! SOCKS5 proxy implementation for host-side network bridging.
+//!
+//! This module provides:
+//! - Host-side SOCKS5 proxy (cross-platform) - handles guest's outbound TCP/UDP via Unix sockets
+//! - Guest-side vsock listeners (Linux-only) - runs inside the VM
+
 use std::{
     collections::HashSet,
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     os::fd::{AsFd, OwnedFd},
     path::Path,
@@ -13,17 +20,30 @@ use fast_socks5::{
     util::target_addr::TargetAddr,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Interest, unix::AsyncFd},
-    net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{TcpStream, UdpSocket, UnixListener, UnixStream},
     sync::{OnceCell, broadcast},
 };
+
+// Linux-only: Interest::PRIORITY for early close detection
+#[cfg(target_os = "linux")]
+use tokio::io::{Interest, unix::AsyncFd};
+
+// Linux-only imports for guest-side vsock functions
+#[cfg(target_os = "linux")]
+use tokio::net::TcpListener;
+#[cfg(target_os = "linux")]
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 
 use crate::{
     DEBUG,
-    raw_udp::{ArchivedUdpPacket, RawUdp, UdpPacket},
-    util::{copy_bidirectional_fastclose, decompose_vsock_stream},
+    packet_types::{ArchivedUdpPacket, UdpPacket},
+    util::copy_bidirectional_fastclose,
 };
+
+// Linux-only import for guest vsock decomposition
+#[cfg(target_os = "linux")]
+use crate::util::decompose_vsock_stream;
 
 static UDPBUS_RX: LazyLock<broadcast::Sender<UdpPacket>> =
     LazyLock::new(|| broadcast::Sender::new(128));
@@ -98,6 +118,13 @@ fn ip_allowed(ip: IpAddr) -> bool {
     }
 }
 
+// =============================================================================
+// HOST-SIDE FUNCTIONS (cross-platform)
+// These listen on Unix sockets and handle guest's outbound network requests.
+// =============================================================================
+
+/// Start SOCKS5 TCP proxy listening on a Unix socket.
+/// This is the host-side handler for guest outbound TCP connections.
 pub fn run_socks5_unix(uds_path: &Path) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -127,6 +154,8 @@ pub fn run_socks5_unix(uds_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start SOCKS5 UDP proxy listening on a Unix socket.
+/// This is the host-side handler for guest outbound UDP connections.
 pub fn run_socks5_udp_unix(uds_path: &Path) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -155,6 +184,13 @@ pub fn run_socks5_udp_unix(uds_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// GUEST-SIDE FUNCTIONS (Linux-only)
+// These run inside the VM and use vsock to communicate with the host.
+// =============================================================================
+
+/// Start SOCKS5 server listening on vsock port 10 inside the guest.
+#[cfg(target_os = "linux")]
 pub fn run_socks5_vsock() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -182,6 +218,9 @@ pub fn run_socks5_vsock() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start TCP-to-vsock proxy inside the guest.
+/// Listens on TCP 127.0.0.10:10 and forwards to host vsock port 10.
+#[cfg(target_os = "linux")]
 pub fn run_socks5_tcp_to_vsock_proxy() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -218,7 +257,12 @@ pub fn run_socks5_tcp_to_vsock_proxy() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start UDP injection handler inside the guest.
+/// Receives UDP packets from host via vsock and injects them into the TUN device.
+#[cfg(target_os = "linux")]
 pub fn run_socks5_udp_injection(tun2socks_ifname: &str) -> anyhow::Result<()> {
+    use crate::raw_udp::RawUdp;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
@@ -251,13 +295,6 @@ pub fn run_socks5_udp_injection(tun2socks_ifname: &str) -> anyhow::Result<()> {
                 let pkt = &pkt[..len];
                 let pkt = rkyv::access::<ArchivedUdpPacket, rkyv::rancor::Error>(pkt).unwrap();
 
-                // eprintln!(
-                //     "INJECT: {}:{}->{}:{}",
-                //     pkt.src_ip.as_ipv4(),
-                //     pkt.src_port.to_native(),
-                //     pkt.dst_ip.as_ipv4(),
-                //     pkt.dst_port.to_native(),
-                // );
                 udp_tx
                     .inject(
                         pkt.src_ip.as_ipv4(),
@@ -281,6 +318,12 @@ pub fn run_socks5_udp_injection(tun2socks_ifname: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// SHARED HELPER FUNCTIONS
+// =============================================================================
+
+// On Linux, use Interest::PRIORITY for early close detection
+#[cfg(target_os = "linux")]
 async fn serve<
     C: AsyncRead + AsyncWrite + Unpin + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
@@ -293,11 +336,23 @@ async fn serve<
     tokio::select! {
       biased;
       _ = sockfd.ready(Interest::PRIORITY) => {
-        // eprintln!("PRIORITY received, shutting down");
         Ok(())
       }
       x = f(conn) => x
     }
+}
+
+// On macOS, run without early close detection (PRIORITY not available)
+#[cfg(target_os = "macos")]
+async fn serve<
+    C: AsyncRead + AsyncWrite + Unpin + 'static,
+    Fut: Future<Output = anyhow::Result<()>>,
+>(
+    conn: C,
+    _sockfd: OwnedFd,
+    f: impl FnOnce(C) -> Fut,
+) -> anyhow::Result<()> {
+    f(conn).await
 }
 
 async fn serve_socks5(conn: OwnedFd) -> anyhow::Result<()> {

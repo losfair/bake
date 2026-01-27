@@ -1,12 +1,16 @@
 mod console;
 mod embed;
 mod fileshare;
-mod firecracker;
+mod hypervisor;
+mod packet_types;
+mod platform;
+#[cfg(target_os = "linux")]
 mod raw_udp;
 mod socks5;
 mod ssh_launcher;
 mod util;
 mod vm_console;
+#[cfg(target_os = "linux")]
 mod vminit;
 mod wireguard;
 
@@ -18,20 +22,17 @@ use rand::Rng;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
-use std::os::raw::{c_char, c_void};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::UnixListener;
 use tokio::runtime::Runtime;
 
 use crate::embed::{EmbeddedInfo, get_embedded_data, write_embedded_data};
-use crate::fileshare::spawn_file_server;
-use crate::firecracker::{BootSource, Drive, FirecrackerConfig, MachineConfig, VsockConfig};
+use crate::fileshare::{spawn_file_server, VolumeSpec};
+use crate::hypervisor::{DriveConfig, Hypervisor, ResourceHandle, VmConfig};
 use crate::util::{
     BootManifest, VolumeManifest, align_up, best_effort_raise_fd_limit,
     copy_bidirectional_fastclose,
@@ -63,6 +64,8 @@ fn main() -> anyhow::Result<()> {
         DEBUG.store(true, Ordering::Relaxed);
     }
 
+    // On Linux, check if we're running as init (PID 1) inside the VM
+    #[cfg(target_os = "linux")]
     if std::env::var("BAKE_NOT_INIT").ok().as_deref() != Some("1") && unsafe { libc::getpid() } == 1
     {
         return vminit::run();
@@ -216,13 +219,13 @@ enum RunSubcommand {
         #[arg(short = 'p', long = "pid")]
         pid: Option<i32>,
         /// Extra ssh(1) arguments after `--`
-        #[arg(trailing_var_arg = true, last = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         ssh_args: Vec<String>,
     },
     /// Print a systemd service unit for current options
     Systemd {
         /// Container arguments (after `--`)
-        #[arg(trailing_var_arg = true, last = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         container_args: Vec<String>,
     },
 }
@@ -247,7 +250,7 @@ struct RunArgs {
     entrypoint: Option<String>,
 
     /// Container arguments (after `--`)
-    #[arg(trailing_var_arg = true, last = true)]
+    #[arg(last = true, allow_hyphen_values = true)]
     container_args: Vec<String>,
 
     /// Container environment variables
@@ -533,23 +536,21 @@ fn run_mode(
         .gid
         .or_else(|| embedded.gid.as_ref().map(|x| x.to_native()));
 
-    // Create memfd for firecracker binary
-    let firecracker_path = unsafe { memfd_from_mmap("firecracker", &embedded.firecracker)? };
+    // Create memory-backed files for embedded resources
+    #[cfg(target_os = "linux")]
+    let firecracker_path = unsafe { platform::create_memfd_from_mmap("firecracker", &embedded.firecracker, Permissions::from_mode(0o777))? };
+    #[cfg(target_os = "macos")]
+    let firecracker_path = platform::create_memfd("firecracker", &embedded.firecracker, Permissions::from_mode(0o777))?;
 
-    // Create memfd for kernel
-    let kernel_path = unsafe { memfd_from_mmap("kernel", &embedded.kernel)? };
+    let kernel_path = unsafe { platform::create_memfd_from_mmap("kernel", &embedded.kernel, Permissions::from_mode(0o644))? };
+    let initrd_path = unsafe { platform::create_memfd_from_mmap("initrd", &embedded.initrd, Permissions::from_mode(0o644))? };
 
-    // Create memfd for initrd
-    let initrd_path = unsafe { memfd_from_mmap("initrd", &embedded.initrd)? };
-
-    // No O_CLOEXEC to be inherited by firecracker
-    let exe_fd = unsafe {
-        libc::open(
-            b"/proc/self/exe\0".as_ptr() as *const c_char,
-            libc::O_RDONLY,
-        )
-    };
+    // Open executable for reading (to access embedded rootfs)
+    let exe_fd = platform::open_self_exe_fd()?;
+    #[cfg(target_os = "linux")]
     let exe_path = format!("/proc/self/fd/{}", exe_fd);
+    #[cfg(target_os = "macos")]
+    let exe_path = platform::get_executable_path()?.to_string_lossy().into_owned();
 
     let rootfs_offset = unsafe { rootfs.as_ptr().offset_from(info.base.as_ptr()) };
     assert!(rootfs_offset % 512 == 0);
@@ -561,6 +562,12 @@ fn run_mode(
         align_up(rootfs.len(), 512) / 512
     );
 
+    // On macOS, Virtualization.framework uses virtio console (hvc0) instead of ttyS0
+    #[cfg(target_os = "macos")]
+    let boot_args = boot_args.replace("console=ttyS0", "console=hvc0");
+    #[cfg(target_os = "macos")]
+    let mut boot_args = boot_args;
+
     if !verbose {
         boot_args.push_str(" quiet");
     }
@@ -570,9 +577,17 @@ fn run_mode(
         boot_args.push_str(" bake.noreboot=1");
     }
 
-    let tmp_base_dir = std::env::temp_dir().join(format!(
-        "bottlefire-bake-fc-{}",
-        faster_hex::hex_string(&rand::rng().random::<[u8; 16]>())
+    // Use /tmp on macOS to keep Unix socket paths under SUN_LEN (104 bytes)
+    // Linux uses /tmp by default and has longer limits (108 bytes)
+    #[cfg(target_os = "macos")]
+    let tmp_base = PathBuf::from("/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let tmp_base = std::env::temp_dir();
+
+    // Use shorter random suffix (8 hex chars = 4 bytes of entropy)
+    let tmp_base_dir = tmp_base.join(format!(
+        "bake-{}",
+        faster_hex::hex_string(&rand::rng().random::<[u8; 4]>())
     ));
     std::fs::create_dir(&tmp_base_dir).with_context(|| {
         format!(
@@ -613,12 +628,14 @@ fn run_mode(
         crate::socks5::set_allow_net(parsed.allow_net.clone());
     }
 
+    // Start host-side SOCKS5 proxy services to handle guest's outbound network requests
     if !parsed.disable_hostnet {
         crate::socks5::run_socks5_unix(&vsock_inbound_socks5_uds)
             .with_context(|| "failed to start socks5 uds listener")?;
     }
     crate::socks5::run_socks5_udp_unix(&vsock_inbound_socks5_udp_uds)
         .with_context(|| "failed to start socks5 udp uds listener")?;
+
     let console_task = host_run_console(RT.get().unwrap(), &vsock_inbound_console)
         .with_context(|| "failed to start console listener")?;
 
@@ -628,12 +645,12 @@ fn run_mode(
             .to_str()
             .expect("invalid vsock_outbound_uds")
             .to_string();
-        spawn_port_forwards(parsed.publish, uds_path);
+        spawn_port_forwards(parsed.publish.clone(), uds_path);
     }
 
     // Start plan9 filesystem server
     let volumes = if !parsed.volume.is_empty() {
-        spawn_file_server(parsed.volume, &vsock_inbound_9p)
+        spawn_file_server(parsed.volume.clone(), &vsock_inbound_9p)
     } else {
         vec![]
     };
@@ -681,6 +698,7 @@ fn run_mode(
 
     let ssh_proxy_path = parsed
         .ssh_sock_path
+        .clone()
         .unwrap_or_else(|| tmp_base_dir.join("ssh.sock"));
     serve_ssh_proxy(&ssh_proxy_path, &vsock_outbound_uds)
         .with_context(|| "failed to start ssh proxy service")?;
@@ -743,136 +761,157 @@ exec ssh -i {} -o "ProxyCommand nc -U {}" -o "UserKnownHostsFile=/dev/null" -o "
     };
     serve_boot_manifest_request(&vsock_inbound_boot_manifest_request, &manifest)?;
 
-    let mut drives = vec![
-        Drive {
-            drive_id: "rootfs".into(),
-            is_root_device: true,
-            is_read_only: true,
-            io_engine: "Async".into(),
-            path_on_host: exe_path,
-        },
-        Drive {
-            drive_id: "ephemeral".into(),
-            is_root_device: false,
-            is_read_only: false,
-            io_engine: "Async".into(),
-            path_on_host: ephemeral_disk
-                .to_str()
-                .expect("invalid ephemeral disk path")
-                .to_string(),
-        },
-    ];
-
-    for (i, vol) in volumes.iter().enumerate() {
-        if vol.ext4 {
-            drives.push(Drive {
-                drive_id: format!("vol-{}", i),
-                is_root_device: false,
-                is_read_only: vol.ro,
-                io_engine: "Async".into(),
-                path_on_host: vol.host.clone(),
-            })
-        }
-    }
-
+    // Platform-specific VM launch using the Hypervisor trait
+    #[cfg(target_os = "linux")]
     {
-        // Convert MB to bytes
-        let disk_size: u64 = parsed.ephemeral_disk_size as u64 * 1024 * 1024;
-        let mut disk = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&ephemeral_disk)
-            .with_context(|| "failed to open ephemeral disk")?;
-        disk.seek(SeekFrom::Start(disk_size - 1))
-            .and_then(|_| disk.write(&[0u8]))
-            .with_context(|| "failed to initialize ephemeral disk")?;
+        launch_vm_linux(
+            &parsed,
+            &exe_path,
+            &kernel_path,
+            &initrd_path,
+            boot_args,
+            &tmp_base_dir,
+            &volumes,
+            cpus,
+            *memory,
+            &firecracker_path,
+            console_task,
+        )
     }
 
-    let firecracker_config = FirecrackerConfig {
-        boot_source: BootSource {
-            kernel_image_path: kernel_path,
-            initrd_path,
+    #[cfg(target_os = "macos")]
+    {
+        launch_vm_macos(
+            &parsed,
+            &kernel_path,
+            &initrd_path,
             boot_args,
-        },
-        drives,
-        machine_config: MachineConfig {
-            vcpu_count: cpus,
-            mem_size_mib: *memory,
-        },
-        network_interfaces: vec![],
-        vsock: VsockConfig {
-            guest_cid: 3,
-            uds_path: vsock_outbound_uds
-                .to_str()
-                .expect("invalid vsock_outbound_uds")
-                .to_string(),
-        },
+            &tmp_base_dir,
+            &volumes,
+            cpus,
+            *memory,
+            console_task,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn launch_vm_linux(
+    parsed: &RunArgs,
+    exe_path: &str,
+    kernel_path: &str,
+    initrd_path: &str,
+    boot_args: String,
+    socket_dir: &Path,
+    volumes: &[VolumeSpec],
+    cpus: u32,
+    memory: u32,
+    firecracker_path: &str,
+    console_task: tokio::task::JoinHandle<()>,
+) -> anyhow::Result<()> {
+    use crate::hypervisor::firecracker::FirecrackerVm;
+
+    // Build extra drives from volumes
+    let extra_drives: Vec<DriveConfig> = volumes
+        .iter()
+        .filter(|v| v.ext4)
+        .enumerate()
+        .map(|(i, v)| DriveConfig {
+            id: format!("vol-{}", i),
+            path: PathBuf::from(&v.host),
+            read_only: v.ro,
+        })
+        .collect();
+
+    let config = VmConfig {
+        cpus,
+        memory_mb: memory,
+        boot_args,
+        kernel: ResourceHandle::File(PathBuf::from(kernel_path)),
+        initrd: ResourceHandle::File(PathBuf::from(initrd_path)),
+        rootfs: ResourceHandle::File(PathBuf::from(exe_path)),
+        socket_dir: socket_dir.to_path_buf(),
+        extra_drives,
+        ephemeral_disk_mb: parsed.ephemeral_disk_size,
+        verbose: parsed.verbose,
     };
 
     // Check for dry run mode
     if std::env::var("BAKE_DRY_RUN").ok().as_deref() == Some("1") {
-        let config_json = serde_json::to_string_pretty(&firecracker_config)?;
+        use crate::hypervisor::firecracker::FirecrackerConfig;
+        // Build config for display without starting VM
+        let fc_config = FirecrackerConfig {
+            boot_source: crate::hypervisor::firecracker::BootSource {
+                kernel_image_path: kernel_path.to_string(),
+                initrd_path: initrd_path.to_string(),
+                boot_args: config.boot_args.clone(),
+            },
+            drives: vec![],
+            machine_config: crate::hypervisor::firecracker::MachineConfig {
+                vcpu_count: cpus,
+                mem_size_mib: memory,
+            },
+            network_interfaces: vec![],
+            vsock: crate::hypervisor::firecracker::VsockConfig {
+                guest_cid: 3,
+                uds_path: socket_dir.join("fc.sock").to_string_lossy().into_owned(),
+            },
+        };
+        let config_json = serde_json::to_string_pretty(&fc_config)?;
         println!("{}", config_json);
         return Ok(());
     }
 
-    let config_json = serde_json::to_vec(&firecracker_config)?;
-    let config_path = mkmemfd("config", &config_json, Permissions::from_mode(0o444))?;
-
-    // Start firecracker with the specified parameters
-    let mut cmd = ProcessCommand::new(&firecracker_path);
-    cmd.arg("--config-file")
-        .arg(config_path)
-        .arg("--no-api")
-        .arg("--enable-pci")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if !*verbose {
-        cmd.arg("--level").arg("error");
-    }
-    unsafe {
-        let ppid = libc::getpid();
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != ppid {
-                libc::abort();
-            }
-            Ok(())
-        });
-    }
-
-    let mut cmd = cmd.spawn()?;
-    let stdout = cmd.stdout.take().unwrap();
-    let stderr = cmd.stderr.take().unwrap();
-    for mut pipe in [
-        Box::new(stdout) as Box<dyn Read + Send + Sync>,
-        Box::new(stderr) as Box<dyn Read + Send + Sync>,
-    ] {
-        std::thread::spawn(move || {
-            let mut buf = vec![0u8; 4096];
-            loop {
-                let Ok(n) = pipe.read(&mut buf) else {
-                    break;
-                };
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout.write_all(&buf[..n]);
-                let _ = stdout.flush();
-            }
-        });
-    }
-    let status = cmd.wait()?;
+    let mut vm = FirecrackerVm::create(config)?;
+    vm.set_firecracker_path(firecracker_path.to_string());
+    let result = vm.run();
     console_task.abort();
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "firecracker exited with status {}",
-            status
-                .code()
-                .map(|x| x.to_string())
-                .unwrap_or_else(|| "unknown".into())
-        ))
-    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn launch_vm_macos(
+    parsed: &RunArgs,
+    kernel_path: &str,
+    initrd_path: &str,
+    boot_args: String,
+    socket_dir: &Path,
+    volumes: &[VolumeSpec],
+    cpus: u32,
+    memory: u32,
+    console_task: tokio::task::JoinHandle<()>,
+) -> anyhow::Result<()> {
+    use crate::hypervisor::virtualization::VirtualizationVm;
+
+    // Build extra drives from volumes
+    let extra_drives: Vec<DriveConfig> = volumes
+        .iter()
+        .filter(|v| v.ext4)
+        .enumerate()
+        .map(|(i, v)| DriveConfig {
+            id: format!("vol-{}", i),
+            path: PathBuf::from(&v.host),
+            read_only: v.ro,
+        })
+        .collect();
+
+    let config = VmConfig {
+        cpus,
+        memory_mb: memory,
+        boot_args,
+        kernel: ResourceHandle::File(PathBuf::from(kernel_path)),
+        initrd: ResourceHandle::File(PathBuf::from(initrd_path)),
+        rootfs: ResourceHandle::File(platform::get_executable_path()?),
+        socket_dir: socket_dir.to_path_buf(),
+        extra_drives,
+        ephemeral_disk_mb: parsed.ephemeral_disk_size,
+        verbose: parsed.verbose,
+    };
+
+    let mut vm = VirtualizationVm::create(config)?;
+    let result = vm.run();
+    console_task.abort();
+    result
 }
 
 fn spawn_port_forwards(publishes: Vec<String>, uds_path: String) {
@@ -991,44 +1030,7 @@ async fn forward_listener(
 }
 
 fn mkmemfd(name: &str, data: &[u8], permissions: Permissions) -> anyhow::Result<String> {
-    use std::ffi::CString;
-    use std::os::unix::io::FromRawFd;
-
-    let name_cstring = CString::new(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid name for memfd"))?;
-
-    // Create memfd
-    // No cloexec!
-    let fd = unsafe { libc::memfd_create(name_cstring.as_ptr(), libc::MFD_ALLOW_SEALING) };
-
-    if fd == -1 {
-        return Err(io::Error::last_os_error().into());
-    }
-
-    // Write data to memfd
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    file.write_all(data)?;
-    file.flush()?;
-
-    // Seal it
-    if unsafe {
-        libc::fcntl(
-            fd,
-            libc::F_ADD_SEALS,
-            libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL,
-        )
-    } != 0
-    {
-        anyhow::bail!("file sealing failed: {:?}", std::io::Error::last_os_error());
-    }
-
-    if unsafe { libc::fchmod(fd, permissions.mode()) } < 0 {
-        anyhow::bail!("fchmod failed: {:?}", std::io::Error::last_os_error());
-    }
-
-    // Return the file descriptor (but don't close it)
-    std::mem::forget(file);
-    Ok(format!("/proc/self/fd/{}", fd))
+    platform::create_memfd(name, data, permissions)
 }
 
 fn serve_boot_manifest_request(path: &Path, manifest: &BootManifest) -> anyhow::Result<()> {
@@ -1075,34 +1077,7 @@ fn serve_ssh_proxy(path: &Path, vsock_outbound_uds: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
-unsafe fn memfd_from_mmap(name: &str, data: &'static [u8]) -> anyhow::Result<String> {
-    unsafe {
-        let pgsize = libc::sysconf(libc::_SC_PAGESIZE);
-        assert!(pgsize >= 4096);
-        let pgsize = pgsize as usize;
-
-        let path = mkmemfd(name, data, Permissions::from_mode(0o777))?;
-        let ptr = data.as_ptr();
-        let end = ptr.add(data.len());
-        let ptr = align_up(ptr as usize, pgsize);
-        let end = end as usize & !(pgsize - 1);
-
-        if end > ptr {
-            if DEBUG.load(Ordering::Relaxed) {
-                eprintln!(
-                    "madvise({:p}, {:#x}, MADV_DONTNEED)",
-                    ptr as *mut c_void,
-                    end - ptr
-                );
-            }
-            assert_eq!(
-                libc::madvise(ptr as *mut c_void, end - ptr, libc::MADV_DONTNEED),
-                0
-            );
-        }
-        Ok(path)
-    }
-}
+// Note: memfd_from_mmap is now provided by platform::create_memfd_from_mmap
 
 unsafe extern "C" fn term_signal(sig: i32) {
     if let Ok(x) = TMP_BASE_DIR.try_lock() {

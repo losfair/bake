@@ -1,22 +1,31 @@
-use std::{
-    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
-    path::Path,
-};
+use std::path::Path;
 
-use anyhow::Context;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, Interest, unix::AsyncFd},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
     runtime::Runtime,
     task::JoinHandle,
 };
+
+// Guest-side imports (Linux-only)
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+#[cfg(target_os = "linux")]
+use tokio::io::{Interest, unix::AsyncFd};
+#[cfg(target_os = "linux")]
 use tokio_vsock::{VsockAddr, VsockStream};
+#[cfg(target_os = "linux")]
+use crate::util::set_nonblocking;
 
-use crate::{
-    console::{ArchivedConsoleResponse, ConsoleRequest, ConsoleResponse},
-    util::set_nonblocking,
-};
+use crate::console::{ConsoleRequest, ConsoleResponse};
+#[cfg(target_os = "linux")]
+use crate::console::ArchivedConsoleResponse;
 
+/// Start console bridge inside the VM guest.
+/// This connects to the host via vsock and bridges to a local PTY.
+#[cfg(target_os = "linux")]
 pub fn start_console_bridge() -> anyhow::Result<OwnedFd> {
     // Runtime to host the vsock bridge tasks; keep it alive.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -34,8 +43,8 @@ pub fn start_console_bridge() -> anyhow::Result<OwnedFd> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         ) != 0
         {
             anyhow::bail!("openpty failed: {:?}", std::io::Error::last_os_error());
@@ -108,6 +117,8 @@ pub fn start_console_bridge() -> anyhow::Result<OwnedFd> {
     Ok(slave_fd)
 }
 
+/// Run console on the host side.
+/// This accepts Unix socket connections and bridges stdin/stdout.
 pub fn host_run_console(rt: &Runtime, path: &Path) -> anyhow::Result<JoinHandle<()>> {
     let listener = rt.block_on(async { UnixListener::bind(path) })?;
     let task = rt.spawn(async move {

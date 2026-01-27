@@ -39,11 +39,34 @@ pub struct EmbeddedInfo {
 unsafe impl Send for EmbeddedInfo {}
 unsafe impl Sync for EmbeddedInfo {}
 
+/// Get the path to the current executable in a cross-platform way.
+fn get_exe_path() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(std::path::PathBuf::from("/proc/self/exe"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::get_executable_path().ok()
+    }
+}
+
 pub fn get_embedded_data() -> Option<EmbeddedInfo> {
-    let me = unsafe { Mmap::map(&File::open("/proc/self/exe").ok()?) }.ok()?;
+    let exe_path = get_exe_path()?;
+    let me_ = unsafe { Mmap::map(&File::open(&exe_path).ok()?) }.ok()?;
+
+    // truncate to first non-zero byte
+    let mut me = unsafe { std::mem::transmute::<&[u8], &[u8]>(&me_[..]) };
+    std::mem::forget(me_);
+    while me.len() > 0 && me[me.len() - 1] == 0 {
+        me = &me[..me.len() - 1];
+    }
+
     if me.len() < 64 {
         return None;
     };
+
     let (prefix, trailer) = me.split_at(me.len() - 64);
     if &trailer[8..64] != &MAGIC[..] {
         return None;
@@ -55,6 +78,5 @@ pub fn get_embedded_data() -> Option<EmbeddedInfo> {
     let data: &'static [u8] =
         unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&prefix[prefix.len() - len..]) };
     let base = NonNull::from(me.as_ref()).cast::<u8>();
-    std::mem::forget(me);
     return Some(EmbeddedInfo { base, data });
 }

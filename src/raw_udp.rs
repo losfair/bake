@@ -4,15 +4,8 @@ use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::{AsyncDevice, Configuration, DeviceReader, DeviceWriter, Layer};
 
-/// Parsed packet view for convenience when receiving
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct UdpPacket {
-    pub src_ip: Ipv4Addr,
-    pub dst_ip: Ipv4Addr,
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub payload: Vec<u8>,
-}
+// Re-export UdpPacket from shared module for backwards compatibility
+pub use crate::packet_types::UdpPacket;
 
 pub struct RawUdp {
     tun_r: tokio::sync::Mutex<DeviceReader>,

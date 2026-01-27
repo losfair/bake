@@ -1,0 +1,3 @@
+[submodule "rust-p9"]
+	path = rust-p9
+	url = https://github.com/google/rust-p9.git
