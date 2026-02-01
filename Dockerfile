@@ -91,8 +91,8 @@ RUN apt-get update && apt-get install -y curl
 WORKDIR /opt
 RUN curl -fsSL -o firecracker-v1.13.1-x86_64.tgz https://github.com/firecracker-microvm/firecracker/releases/download/v1.13.1/firecracker-v1.13.1-x86_64.tgz && \
   curl -fsSL -o firecracker-v1.13.1-aarch64.tgz https://github.com/firecracker-microvm/firecracker/releases/download/v1.13.1/firecracker-v1.13.1-aarch64.tgz && \
-  tar xzf firecracker-v1.13.1-x86_64.tgz && \
-  tar xzf firecracker-v1.13.1-aarch64.tgz && \
+  tar xzf firecracker-v1.13.1-x86_64.tgz --no-same-owner && \
+  tar xzf firecracker-v1.13.1-aarch64.tgz --no-same-owner && \
   mv release-v1.13.1-x86_64/firecracker-v1.13.1-x86_64 ./firecracker.amd64 && \
   mv release-v1.13.1-aarch64/firecracker-v1.13.1-aarch64 ./firecracker.arm64
 
