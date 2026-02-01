@@ -8,12 +8,11 @@
 unsafe extern "C" {}
 
 use std::ffi::c_void;
-use std::fs::{File, OpenOptions, Permissions};
-use std::io::{Read as _, Seek, SeekFrom, Write};
+use std::fs::{File, Permissions};
+use std::io::Read as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -21,9 +20,12 @@ use block2::StackBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{class, msg_send, msg_send_id};
-use objc2_foundation::{NSError, NSFileHandle, NSMutableArray, NSString, NSURL};
+use objc2_foundation::{NSError, NSMutableArray, NSString, NSURL};
 
-use super::{DriveConfig, EmbeddedSource, Hypervisor, HypervisorResult, ResourceHandle, VmConfig, VmState};
+use super::{
+    create_ephemeral_disk, EmbeddedSource, Hypervisor, HypervisorResult, ResourceHandle, VmConfig,
+    VmState,
+};
 use crate::platform;
 
 /// Thread-safe wrapper for ObjC objects.
@@ -154,7 +156,7 @@ impl Hypervisor for VirtualizationVm {
 
         // Create ephemeral disk
         let ephemeral_path = self.config.socket_dir.join("ephemeral.img");
-        self.create_ephemeral_disk(&ephemeral_path)?;
+        create_ephemeral_disk(&ephemeral_path, self.config.ephemeral_disk_mb)?;
 
         unsafe {
             // Create VM configuration
@@ -177,17 +179,8 @@ impl Hypervisor for VirtualizationVm {
             let _: () = msg_send![boot_loader, setInitialRamdiskURL: &*initrd_url];
 
             // Set boot arguments
-            eprintln!("[DEBUG] boot_args: {}", &self.config.boot_args);
             let boot_args_ns = NSString::from_str(&self.config.boot_args);
             let _: () = msg_send![boot_loader, setCommandLine: &*boot_args_ns];
-
-            // Verify command line was set
-            let readback: Option<Retained<NSString>> = msg_send_id![boot_loader, commandLine];
-            if let Some(rb) = readback {
-                eprintln!("[DEBUG] commandLine readback: {}", rb.to_string());
-            } else {
-                eprintln!("[DEBUG] commandLine readback: None");
-            }
 
             // Attach boot loader to config
             let _: () = msg_send![vz_config, setBootLoader: boot_loader];
@@ -401,20 +394,6 @@ impl VirtualizationVm {
                 Ok(path)
             }
         }
-    }
-
-    /// Create the ephemeral disk as a sparse file.
-    fn create_ephemeral_disk(&self, path: &Path) -> HypervisorResult<()> {
-        let disk_size: u64 = self.config.ephemeral_disk_mb as u64 * 1024 * 1024;
-        let mut disk = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .context("failed to create ephemeral disk")?;
-        disk.seek(SeekFrom::Start(disk_size - 1))
-            .and_then(|_| disk.write(&[0u8]))
-            .context("failed to initialize ephemeral disk")?;
-        Ok(())
     }
 
     /// Create console device configuration for serial I/O.
@@ -675,10 +654,11 @@ fn handle_vsock_connect(
 
     // Now proxy data between the Unix stream and the vsock fd
     let unix_fd = stream.as_raw_fd();
-    let vsock_fd = fd.as_raw_fd();
-    std::mem::forget(fd); // Keep the fd alive
+    // Take ownership of the raw fd - we're responsible for closing it
+    let vsock_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
 
-    std::thread::spawn(move || {
+    // Spawn thread for unix->vsock direction
+    let handle = std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             let n = unsafe { libc::read(unix_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
@@ -702,6 +682,7 @@ fn handle_vsock_connect(
         }
     });
 
+    // Handle vsock->unix direction in main thread
     let mut buf = [0u8; 8192];
     loop {
         let n = unsafe { libc::read(vsock_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
@@ -718,11 +699,20 @@ fn handle_vsock_connect(
                 )
             };
             if w <= 0 {
-                return Ok(());
+                break;
             }
             written += w as usize;
         }
     }
+
+    // Shutdown the vsock fd to unblock the reader thread, then close it
+    unsafe {
+        libc::shutdown(vsock_fd, libc::SHUT_RDWR);
+        libc::close(vsock_fd);
+    }
+
+    // Wait for the reader thread to finish
+    let _ = handle.join();
 
     Ok(())
 }

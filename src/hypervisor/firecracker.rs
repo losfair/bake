@@ -3,17 +3,20 @@
 //! This module provides the Linux-specific VM implementation using Firecracker
 //! with KVM as the hypervisor backend.
 
-use std::fs::{OpenOptions, Permissions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::Permissions;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use super::{EmbeddedSource, Hypervisor, HypervisorResult, ResourceHandle, VmConfig, VmState};
+use super::{
+    create_ephemeral_disk, EmbeddedSource, Hypervisor, HypervisorResult, ResourceHandle, VmConfig,
+    VmState,
+};
 use crate::platform;
 
 /// Firecracker VM instance.
@@ -24,8 +27,6 @@ pub struct FirecrackerVm {
     firecracker_path: String,
     /// Path to the vsock outbound Unix socket
     vsock_uds_path: PathBuf,
-    /// Child process handle
-    child: Option<Child>,
 }
 
 impl Hypervisor for FirecrackerVm {
@@ -37,7 +38,6 @@ impl Hypervisor for FirecrackerVm {
             state: VmState::Creating,
             firecracker_path: String::new(),
             vsock_uds_path,
-            child: None,
         })
     }
 
@@ -146,7 +146,7 @@ impl FirecrackerVm {
 
         // Create ephemeral disk
         let ephemeral_disk_path = self.config.socket_dir.join("ephemeral.img");
-        self.create_ephemeral_disk(&ephemeral_disk_path)?;
+        create_ephemeral_disk(&ephemeral_disk_path, self.config.ephemeral_disk_mb)?;
 
         // Build drives list
         let mut drives = vec![
@@ -197,34 +197,18 @@ impl FirecrackerVm {
     }
 
     /// Convert a ResourceHandle to a file path string.
-    fn resource_to_path(&self, handle: &ResourceHandle, _name: &str) -> HypervisorResult<String> {
+    fn resource_to_path(&self, handle: &ResourceHandle, name: &str) -> HypervisorResult<String> {
         match handle {
-            ResourceHandle::Embedded { source, .. } => {
-                match source {
-                    EmbeddedSource::Fd(fd) => Ok(format!("/proc/self/fd/{}", fd)),
-                    EmbeddedSource::Path(path) => Ok(path.to_string_lossy().into_owned()),
-                }
-            }
+            ResourceHandle::Embedded { source, .. } => match source {
+                EmbeddedSource::Fd(fd) => Ok(format!("/proc/self/fd/{}", fd)),
+                EmbeddedSource::Path(path) => Ok(path.to_string_lossy().into_owned()),
+            },
             ResourceHandle::File(path) => Ok(path.to_string_lossy().into_owned()),
             ResourceHandle::Memory(data) => {
-                let path = platform::create_memfd(_name, data, Permissions::from_mode(0o444))?;
+                let path = platform::create_memfd(name, data, Permissions::from_mode(0o444))?;
                 Ok(path)
             }
         }
-    }
-
-    /// Create the ephemeral disk as a sparse file.
-    fn create_ephemeral_disk(&self, path: &Path) -> HypervisorResult<()> {
-        let disk_size: u64 = self.config.ephemeral_disk_mb as u64 * 1024 * 1024;
-        let mut disk = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .context("failed to create ephemeral disk")?;
-        disk.seek(SeekFrom::Start(disk_size - 1))
-            .and_then(|_| disk.write(&[0u8]))
-            .context("failed to initialize ephemeral disk")?;
-        Ok(())
     }
 }
 

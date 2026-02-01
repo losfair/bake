@@ -56,6 +56,7 @@ pub unsafe fn create_memfd_from_mmap(
 ///
 /// On Linux, this returns /proc/self/exe or a file descriptor path.
 /// On macOS, this uses _NSGetExecutablePath.
+#[allow(dead_code)]
 pub fn get_executable_path() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     return linux::get_executable_path();
@@ -75,16 +76,6 @@ pub fn open_self_exe_fd() -> anyhow::Result<i32> {
 #[cfg(target_os = "macos")]
 pub fn open_self_exe_fd() -> anyhow::Result<i32> {
     macos::open_self_exe_fd()
-}
-
-/// Get the number of available CPUs.
-pub fn get_cpu_count() -> u32 {
-    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if n > 0 {
-        n as u32
-    } else {
-        1
-    }
 }
 
 /// Create a temporary file with the given data (macOS only).

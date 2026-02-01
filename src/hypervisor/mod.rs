@@ -5,18 +5,17 @@
 //! - Linux: Firecracker + KVM
 //! - macOS: Apple Virtualization.framework
 
-use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 #[cfg(target_os = "linux")]
 pub mod firecracker;
-#[cfg(target_os = "linux")]
-pub use firecracker::FirecrackerVm as PlatformVm;
 
 #[cfg(target_os = "macos")]
 pub mod virtualization;
-#[cfg(target_os = "macos")]
-pub use virtualization::VirtualizationVm as PlatformVm;
 
 /// Platform-agnostic VM configuration.
 #[derive(Debug, Clone)]
@@ -47,6 +46,7 @@ pub struct VmConfig {
 #[derive(Debug, Clone)]
 pub struct DriveConfig {
     /// Unique identifier for the drive
+    #[allow(dead_code)]
     pub id: String,
     /// Path to the disk image on host
     pub path: PathBuf,
@@ -56,6 +56,7 @@ pub struct DriveConfig {
 
 /// Handle to a resource (kernel, initrd, rootfs).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ResourceHandle {
     /// Resource embedded in the binary at a specific offset
     Embedded {
@@ -74,6 +75,7 @@ pub enum ResourceHandle {
 
 /// Source of embedded data.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum EmbeddedSource {
     /// File descriptor number (for /proc/self/fd/N)
     Fd(i32),
@@ -86,72 +88,11 @@ pub enum EmbeddedSource {
 pub enum VmState {
     /// VM is being created
     Creating,
-    /// VM is ready to start
-    Ready,
     /// VM is running
     Running,
     /// VM has stopped
     Stopped,
-    /// VM encountered an error
-    Error,
 }
-
-/// A connected vsock stream.
-///
-/// This is a platform-agnostic wrapper around vsock connections.
-pub struct VsockStream {
-    inner: VsockStreamInner,
-}
-
-enum VsockStreamInner {
-    #[cfg(target_os = "linux")]
-    Unix(tokio::net::UnixStream),
-    #[cfg(target_os = "macos")]
-    Macos(OwnedFd),
-}
-
-impl VsockStream {
-    /// Create from a Unix stream (used on Linux with Firecracker's vsock proxy).
-    #[cfg(target_os = "linux")]
-    pub fn from_unix(stream: tokio::net::UnixStream) -> Self {
-        Self {
-            inner: VsockStreamInner::Unix(stream),
-        }
-    }
-
-    /// Create from a raw file descriptor (used on macOS).
-    #[cfg(target_os = "macos")]
-    pub fn from_fd(fd: OwnedFd) -> Self {
-        Self {
-            inner: VsockStreamInner::Macos(fd),
-        }
-    }
-
-    /// Convert to a standard owned file descriptor.
-    pub fn into_fd(self) -> std::io::Result<OwnedFd> {
-        match self.inner {
-            #[cfg(target_os = "linux")]
-            VsockStreamInner::Unix(stream) => {
-                use std::os::unix::io::IntoRawFd;
-                let std_stream = stream.into_std()?;
-                Ok(unsafe { OwnedFd::from_raw_fd(std_stream.into_raw_fd()) })
-            }
-            #[cfg(target_os = "macos")]
-            VsockStreamInner::Macos(fd) => Ok(fd),
-        }
-    }
-
-    /// Get a reference to the inner Unix stream (Linux only).
-    #[cfg(target_os = "linux")]
-    pub fn as_unix_stream(&mut self) -> Option<&mut tokio::net::UnixStream> {
-        match &mut self.inner {
-            VsockStreamInner::Unix(stream) => Some(stream),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-use std::os::unix::io::FromRawFd;
 
 /// Result type for hypervisor operations.
 pub type HypervisorResult<T> = anyhow::Result<T>;
@@ -170,22 +111,30 @@ pub trait Hypervisor: Sized + Send {
     fn run(&mut self) -> HypervisorResult<()>;
 
     /// Get the path to connect to vsock via the outbound Unix socket.
+    #[allow(dead_code)]
     fn vsock_connect_path(&self) -> &std::path::Path;
 
     /// Get the path pattern for vsock listeners (e.g., "/path/fc.sock_{port}").
+    #[allow(dead_code)]
     fn vsock_listen_path(&self, port: u32) -> PathBuf;
 
     /// Get the current state of the VM.
+    #[allow(dead_code)]
     fn state(&self) -> VmState;
 }
 
-/// Connect to a vsock port through the platform's vsock proxy.
+/// Create a sparse ephemeral disk file.
 ///
-/// On Linux, this connects to Firecracker's Unix socket and sends a CONNECT command.
-/// On macOS, this uses Virtualization.framework's vsock device.
-pub async fn vsock_connect(
-    uds_path: &std::path::Path,
-    port: u32,
-) -> HypervisorResult<tokio::net::UnixStream> {
-    crate::util::vsock_uds_connect(uds_path, port).await
+/// This is shared between Firecracker and Virtualization.framework implementations.
+pub fn create_ephemeral_disk(path: &Path, size_mb: u32) -> HypervisorResult<()> {
+    let disk_size: u64 = size_mb as u64 * 1024 * 1024;
+    let mut disk = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .context("failed to create ephemeral disk")?;
+    disk.seek(SeekFrom::Start(disk_size - 1))
+        .and_then(|_| disk.write(&[0u8]))
+        .context("failed to initialize ephemeral disk")?;
+    Ok(())
 }

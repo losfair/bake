@@ -22,7 +22,7 @@ use rand::Rng;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -537,18 +537,31 @@ fn run_mode(
         .or_else(|| embedded.gid.as_ref().map(|x| x.to_native()));
 
     // Create memory-backed files for embedded resources
+    // Firecracker binary is only needed on Linux
     #[cfg(target_os = "linux")]
-    let firecracker_path = unsafe { platform::create_memfd_from_mmap("firecracker", &embedded.firecracker, Permissions::from_mode(0o777))? };
-    #[cfg(target_os = "macos")]
-    let firecracker_path = platform::create_memfd("firecracker", &embedded.firecracker, Permissions::from_mode(0o777))?;
+    let firecracker_path = unsafe {
+        platform::create_memfd_from_mmap(
+            "firecracker",
+            &embedded.firecracker,
+            Permissions::from_mode(0o777),
+        )?
+    };
 
-    let kernel_path = unsafe { platform::create_memfd_from_mmap("kernel", &embedded.kernel, Permissions::from_mode(0o644))? };
-    let initrd_path = unsafe { platform::create_memfd_from_mmap("initrd", &embedded.initrd, Permissions::from_mode(0o644))? };
+    let kernel_path = unsafe {
+        platform::create_memfd_from_mmap("kernel", &embedded.kernel, Permissions::from_mode(0o644))?
+    };
+    let initrd_path = unsafe {
+        platform::create_memfd_from_mmap("initrd", &embedded.initrd, Permissions::from_mode(0o644))?
+    };
 
     // Open executable for reading (to access embedded rootfs)
-    let exe_fd = platform::open_self_exe_fd()?;
+    // On Linux, we use /proc/self/fd/N to pass the executable to firecracker
+    // On macOS, we use the actual executable path
     #[cfg(target_os = "linux")]
-    let exe_path = format!("/proc/self/fd/{}", exe_fd);
+    let exe_path = {
+        let exe_fd = platform::open_self_exe_fd()?;
+        format!("/proc/self/fd/{}", exe_fd)
+    };
     #[cfg(target_os = "macos")]
     let exe_path = platform::get_executable_path()?.to_string_lossy().into_owned();
 
@@ -564,9 +577,9 @@ fn run_mode(
 
     // On macOS, Virtualization.framework uses virtio console (hvc0) instead of ttyS0
     #[cfg(target_os = "macos")]
-    let boot_args = boot_args.replace("console=ttyS0", "console=hvc0");
-    #[cfg(target_os = "macos")]
-    let mut boot_args = boot_args;
+    {
+        boot_args = boot_args.replace("console=ttyS0", "console=hvc0");
+    }
 
     if !verbose {
         boot_args.push_str(" quiet");
@@ -616,7 +629,6 @@ fn run_mode(
         }
         prev_hook(info)
     }));
-    let ephemeral_disk = tmp_base_dir.join("ephemeral.img");
     let vsock_outbound_uds = tmp_base_dir.join("fc.sock");
     let vsock_inbound_socks5_uds = tmp_base_dir.join("fc.sock_10");
     let vsock_inbound_socks5_udp_uds = tmp_base_dir.join("fc.sock_11");
@@ -1076,8 +1088,6 @@ fn serve_ssh_proxy(path: &Path, vsock_outbound_uds: &Path) -> anyhow::Result<()>
     });
     Ok(())
 }
-
-// Note: memfd_from_mmap is now provided by platform::create_memfd_from_mmap
 
 unsafe extern "C" fn term_signal(sig: i32) {
     if let Ok(x) = TMP_BASE_DIR.try_lock() {

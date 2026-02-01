@@ -97,6 +97,7 @@ pub unsafe fn memfd_from_mmap(
 }
 
 /// Get the path to the current executable.
+#[allow(dead_code)]
 pub fn get_executable_path() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from("/proc/self/exe"))
 }
@@ -117,24 +118,4 @@ pub fn open_self_exe_fd() -> anyhow::Result<i32> {
     }
 
     Ok(fd)
-}
-
-/// Setup process death signal so child dies when parent exits.
-///
-/// This should be called in the child process via pre_exec.
-///
-/// # Safety
-///
-/// This function must be called from a context where it is safe to call
-/// libc::prctl and libc::getppid.
-pub unsafe fn setup_parent_death_signal(parent_pid: i32) -> io::Result<()> {
-    unsafe {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent_pid {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to set parent death signal",
-            ));
-        }
-    }
-    Ok(())
 }

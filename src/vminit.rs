@@ -6,7 +6,6 @@ use anyhow::Context;
 use nix::mount::MsFlags;
 use serde_json::json;
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fs::{self, OpenOptions, Permissions},
     io::Write,
