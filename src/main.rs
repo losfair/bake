@@ -911,6 +911,7 @@ exec ssh -i {} -o "ProxyCommand nc -U {}" -o "UserKnownHostsFile=/dev/null" -o "
         .arg(config_path)
         .arg("--no-api")
         .arg("--enable-pci")
+        .arg0("bake.firecracker")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

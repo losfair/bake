@@ -387,12 +387,12 @@ async fn serve_socks5_udp(
                 }
                 continue;
             }
-            socket
+            let _ = socket
                 .send_to(
                     &packet.payload,
                     SocketAddr::new(packet.dst_ip.as_ipv4().into(), packet.dst_port.to_native()),
                 )
-                .await?;
+                .await;
             if DEBUG.load(Ordering::Relaxed) {
                 eprintln!(
                     "UDP TX {}:{}->{}:{}",
