@@ -62,7 +62,8 @@ Subcommands:
 Depending on whether embedded data is detected and whether running as PID 1, `bake` runs in one of the following modes:
 
 - If PID is 1 and env var `BAKE_NOT_INIT` is not `1`: vminit mode. `bake` assumes that it is running as the init task inside the Firecracker VM, and perform the init sequence.
-- If PID is not 1, and embedded data is detected: run mode - accept Firecracker startup parameters (e.g. number of CPUs, memory size, network config), extract kernel and initrd into memfd, start firecracker.
+- If PID is not 1, embedded data is detected, an init script is embedded, and `BAKE_RUN_VM` is not `1`: init script mode - execute the embedded init script, which can then invoke the VM.
+- If PID is not 1, and embedded data is detected (no init script, or `BAKE_RUN_VM=1`): run mode - accept Firecracker startup parameters (e.g. number of CPUs, memory size, network config), extract kernel and initrd into memfd, start firecracker.
 - If PID is not 1, and embedded data is not detected: build mode - accept `--input`, `--firecracker`, `--kernel`, `--initrd`, `--rootfs`, build a binary from `/proc/self/exe` (or the provided input elf) with everything embedded.
 
 ### Init sequence (src/vminit.rs)
@@ -200,3 +201,61 @@ Example:
 ```bash
 $ ./output/app.elf --wireguard-conf-file ./wg.conf -- some_command
 ```
+
+### Init scripts
+
+Use `--init-script` at build time to embed a script that runs before the VM starts. This allows pre-flight checks, environment setup, or custom launch logic.
+
+```bash
+# Build with an init script
+$ docker run -it --rm \
+  -v ./rootfs.squashfs.img:/rootfs.img:ro \
+  -v ./output:/output \
+  -v ./init.sh:/init.sh:ro \
+  --entrypoint /opt/bake/bake.amd64 \
+  ghcr.io/losfair/bake \
+  --input /opt/bake/bake.amd64 \
+  --firecracker /opt/bake/firecracker.amd64 \
+  --kernel /opt/bake/kernel.amd64 \
+  --initrd /opt/bake/initrd.amd64.img \
+  --rootfs /rootfs.img \
+  --init-script /init.sh \
+  --output /output/app.elf
+```
+
+When executed, the binary runs the init script instead of directly launching the VM. The script receives:
+
+- `BAKE_EXE`: Path to the bake binary (as `/proc/self/fd/N`). Use this to invoke the VM.
+- All CLI arguments are passed through to the script.
+
+To start the VM from the script, set `BAKE_RUN_VM=1` and exec `$BAKE_EXE`:
+
+```bash
+#!/bin/bash
+set -e
+
+echo "Running pre-flight checks..."
+
+# Validate required environment
+if [[ -z "$API_KEY" ]]; then
+    echo "Error: API_KEY not set" >&2
+    exit 1
+fi
+
+# Check available memory
+mem_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+if [[ "$mem_kb" -lt 524288 ]]; then
+    echo "Warning: Less than 512MB RAM available"
+fi
+
+# Start the VM, passing through all arguments
+exec env BAKE_RUN_VM=1 "$BAKE_EXE" "$@"
+```
+
+To bypass the init script and run the VM directly:
+
+```bash
+$ BAKE_RUN_VM=1 ./output/app.elf
+```
+
+Subcommands (`ssh`, `systemd`) bypass the init script automatically.

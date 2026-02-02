@@ -21,6 +21,7 @@ use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::os::raw::{c_char, c_void};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -56,6 +57,7 @@ struct Embedded {
     cwd: String,
     uid: Option<u32>,
     gid: Option<u32>,
+    init_script: Option<Vec<u8>>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,8 +73,23 @@ fn main() -> anyhow::Result<()> {
     // Check if we have embedded data by looking for our custom sections
     let embedded = check_for_embedded_sections();
 
-    if let Some(embedded) = embedded {
-        run_mode(embedded)
+    if let Some((info, rootfs, archived)) = embedded {
+        // Check for init script mode:
+        // - init_script is present
+        // - BAKE_RUN_VM is not set (allows script to invoke VM)
+        // - not a subcommand (ssh, systemd)
+        let is_subcommand = std::env::args()
+            .nth(1)
+            .map(|arg| arg == "ssh" || arg == "systemd")
+            .unwrap_or(false);
+
+        if let Some(script) = archived.init_script.as_ref() {
+            if std::env::var("BAKE_RUN_VM").ok().as_deref() != Some("1") && !is_subcommand {
+                return init_script_mode(script.as_slice());
+            }
+        }
+
+        run_mode((info, rootfs, archived))
     } else {
         build_mode()
     }
@@ -116,6 +133,10 @@ struct BuildArgs {
 
     #[arg(long)]
     gid: Option<u32>,
+
+    /// Path to init script to embed (runs before VM launch)
+    #[arg(long)]
+    init_script: Option<PathBuf>,
 }
 
 fn check_for_embedded_sections() -> Option<(EmbeddedInfo, &'static [u8], &'static ArchivedEmbedded)>
@@ -154,6 +175,14 @@ fn build_mode() -> anyhow::Result<()> {
     let cwd = args.cwd.clone().unwrap_or_default();
     let uid = args.uid.clone();
     let gid = args.gid.clone();
+    let init_script = if let Some(ref path) = args.init_script {
+        Some(
+            std::fs::read(path)
+                .with_context(|| format!("failed to read init script from {}", path.display()))?,
+        )
+    } else {
+        None
+    };
 
     // Read resource files
     let firecracker_data = &*Box::leak(Box::new(unsafe {
@@ -175,6 +204,7 @@ fn build_mode() -> anyhow::Result<()> {
         cwd,
         uid,
         gid,
+        init_script,
     };
     let embedded = rkyv::to_bytes::<rkyv::rancor::Error>(&embedded).expect("serialization failed");
     let embedded_len = (embedded.len() as u32).to_le_bytes();
@@ -436,6 +466,39 @@ WantedBy=multi-user.target
 
     print!("{}", service_file);
     Ok(())
+}
+
+fn init_script_mode(script: &[u8]) -> anyhow::Result<()> {
+    // Create executable memfd for the script
+    let script_path = mkmemfd("init-script", script, Permissions::from_mode(0o755))?;
+
+    // Open /proc/self/exe before exec - after exec, /proc/self/exe will point to the interpreter
+    // No O_CLOEXEC so the fd survives exec
+    let exe_fd = unsafe {
+        libc::open(
+            b"/proc/self/exe\0".as_ptr() as *const c_char,
+            libc::O_RDONLY,
+        )
+    };
+    if exe_fd < 0 {
+        return Err(anyhow::anyhow!(
+            "failed to open /proc/self/exe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let exe_path = format!("/proc/self/fd/{}", exe_fd);
+
+    // Get original args (skip argv[0])
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Execute the script from memfd, replacing this process
+    let err = ProcessCommand::new(&script_path)
+        .args(&args)
+        .env("BAKE_EXE", &exe_path)
+        .exec();
+
+    // If exec returns, it failed
+    Err(anyhow::anyhow!("failed to exec init script: {}", err))
 }
 
 fn run_mode(
@@ -763,6 +826,29 @@ exec ssh -i {} -o "ProxyCommand nc -U {}" -o "UserKnownHostsFile=/dev/null" -o "
         },
     ];
 
+    // Take file locks on ext4 disk images to prevent concurrent access
+    let mut disk_locks: Vec<File> = vec![];
+    for vol in volumes.iter() {
+        if vol.ext4 {
+            let file = File::open(&vol.host)
+                .with_context(|| format!("failed to open ext4 volume: {}", vol.host))?;
+            let lock_type = if vol.ro {
+                libc::LOCK_SH | libc::LOCK_NB
+            } else {
+                libc::LOCK_EX | libc::LOCK_NB
+            };
+            let fd = file.as_raw_fd();
+            if unsafe { libc::flock(fd, lock_type) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    anyhow::bail!("ext4 volume {} is locked by another process", vol.host);
+                }
+                anyhow::bail!("failed to lock ext4 volume {}: {}", vol.host, err);
+            }
+            disk_locks.push(file);
+        }
+    }
+
     for (i, vol) in volumes.iter().enumerate() {
         if vol.ext4 {
             drives.push(Drive {
@@ -861,7 +947,9 @@ exec ssh -i {} -o "ProxyCommand nc -U {}" -o "UserKnownHostsFile=/dev/null" -o "
         });
     }
     let status = cmd.wait()?;
+    drop(disk_locks); // Release ext4 disk locks after VM exits
     console_task.abort();
+    let _ = RT.get().unwrap().block_on(console_task);
     if status.success() {
         Ok(())
     } else {

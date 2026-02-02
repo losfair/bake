@@ -8,4 +8,4 @@ if [ -f "$HOME/proxy.sh" ]; then
   echo "Loaded proxy configuration"
 fi
 
-docker build -t bake --build-arg http_proxy --build-arg https_proxy .
+docker build -t bake --ulimit=nofile=100000:100000 --build-arg http_proxy --build-arg https_proxy .
